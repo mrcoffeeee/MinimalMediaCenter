@@ -1,0 +1,22 @@
+# Media Catalog Configuration
+# These values can also be changed from Settings in the web interface.
+#
+#
+# API-Key: Your OMDB API key
+# Startup-Language: de = German, en = English
+# Scan-On-Startup: Yes = scan media folders at startup, No = open the existing database immediately
+#
+# Path examples:
+# Windows UNC:     Movies-Path=\\IP\PATH_TO_MOVIES
+# Windows UNC:     Series-Path=\\IP\PATH_TO_SERIES
+# Windows drive:   Movies-Path=Z:\PATH_TO_MOVIES
+# Windows drive:   Series-Path=Z:\PATH_TO_SERIES
+# Linux mount:     Movies-Path=/mnt/PATH_TO_MOVIES
+# Linux mount:     Series-Path=/mnt/PATH_TO_SERIES
+
+API-Key=
+Max-Requests=
+Startup-Language=en
+Scan-On-Startup=Yes
+Movies-Path=
+Series-Path=
