@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.0"
+VERSION = "4.15.1"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
 DEFAULT_OMDB_API_KEY = "fae48dc5"
@@ -3453,10 +3453,17 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
 .random-info .random-facts {{ color:var(--muted); font-size:.88rem; margin-bottom:10px; }}
 .random-info .random-plot {{ line-height:1.45; }}
 .random-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+.alphabet-nav {{ position:fixed; z-index:7; right:7px; top:50%; transform:translateY(-50%); display:flex; flex-direction:column; gap:1px; padding:5px 4px; max-height:calc(100vh - 150px); overflow-y:auto; border:1px solid rgba(75,85,99,.7); border-radius:10px; background:rgba(17,19,24,.88); backdrop-filter:blur(8px); box-shadow:0 6px 20px rgba(0,0,0,.24); scrollbar-width:none; }}
+.alphabet-nav::-webkit-scrollbar {{ display:none; }}
+.alphabet-nav button {{ width:24px; min-height:20px; padding:1px 0; border-radius:5px; background:transparent; color:#cdd3dd; font-size:.69rem; line-height:1; font-weight:750; }}
+.alphabet-nav button:hover:not(:disabled),.alphabet-nav button:focus-visible {{ background:#343c48; color:#fff; }}
+.alphabet-nav button:disabled {{ color:#505865; cursor:default; opacity:.42; }}
+.card {{ scroll-margin-top:185px; }}
+.card.letter-jump {{ outline:2px solid rgba(245,196,81,.8); outline-offset:2px; }}
 @media (max-width:1050px) {{ .filter-panel {{ grid-template-columns:repeat(3,minmax(140px,1fr)); }} }}
 @media (max-width:760px) {{ .header-main {{ align-items:flex-start; }} .header-actions {{ justify-content:flex-start; width:100%; }} .search-row {{ flex-wrap:wrap; }} .search-row .main-search,.search-row .filename-search {{ flex:1 1 100%; width:100%; }} .filter-toggle,.search-row .reset-filters {{ flex:1 1 auto; }} .filter-panel {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} }}
 @media (max-width:480px) {{ .brand-row {{ width:100%; justify-content:space-between; }} .filter-panel {{ grid-template-columns:1fr; }} }}
-@media (max-width:560px) {{ .grid {{ grid-template-columns:1fr; }} .card {{ grid-template-columns:105px 1fr; }} .poster-slot,.poster {{ width:105px; height:158px; }} .random-layout {{ grid-template-columns:95px minmax(0,1fr); gap:12px; }} .random-poster {{ width:95px; height:143px; }} }}
+@media (max-width:560px) {{ .grid {{ grid-template-columns:1fr; }} .card {{ grid-template-columns:105px 1fr; }} .poster-slot,.poster {{ width:105px; height:158px; }} .random-layout {{ grid-template-columns:95px minmax(0,1fr); gap:12px; }} .random-poster {{ width:95px; height:143px; }} .alphabet-nav {{ right:3px; padding:3px 2px; }} .alphabet-nav button {{ width:20px; min-height:18px; font-size:.61rem; }} }}
 </style>
 </head>
 <body>
@@ -3530,6 +3537,9 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
 <div class="grid" id="grid">{''.join(cards)}</div>
 <div class="empty" id="empty" style="display:none" data-i18n="noMatches">Keine passenden Titel.</div>
 </main>
+<nav id="alphabetNav" class="alphabet-nav" aria-label="A–Z navigation">
+  {''.join(f'<button type="button" data-letter="{letter}" onclick="jumpToLetter(\'{letter}\')">{letter}</button>' for letter in ['#'] + list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'))}
+</nav>
 <dialog id="randomDialog" class="random-dialog">
   <div class="random-dialog-inner">
     <div class="random-dialog-head">
@@ -3739,6 +3749,37 @@ function updateFilterSummary() {{
   }}
 }}
 
+function titleInitial(card) {{
+  let title = (card.dataset.title || '').trim();
+  if (!title) return '#';
+  // Treat German/European accented initials naturally: Ä→A, Ö→O, Ü→U, É→E.
+  let first = title.charAt(0);
+  try {{ first = first.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }} catch (_) {{}}
+  first = first.toUpperCase();
+  return /^[A-Z]$/.test(first) ? first : '#';
+}}
+
+function updateAlphabetNav() {{
+  const available = new Set();
+  document.querySelectorAll('.card').forEach(card => {{
+    if (card.style.display !== 'none') available.add(titleInitial(card));
+  }});
+  document.querySelectorAll('#alphabetNav button[data-letter]').forEach(button => {{
+    button.disabled = !available.has(button.dataset.letter || '');
+  }});
+}}
+
+function jumpToLetter(letter) {{
+  const target = Array.from(document.querySelectorAll('.card')).find(card =>
+    card.style.display !== 'none' && titleInitial(card) === letter
+  );
+  if (!target) return;
+  document.querySelectorAll('.card.letter-jump').forEach(card => card.classList.remove('letter-jump'));
+  target.classList.add('letter-jump');
+  target.scrollIntoView({{behavior:'smooth', block:'start'}});
+  window.setTimeout(() => target.classList.remove('letter-jump'), 1200);
+}}
+
 function filterCards() {{
   const q = document.getElementById('search').value.trim().toLocaleLowerCase();
   const filenameQuery = document.getElementById('filenameSearch').value.trim().toLocaleLowerCase();
@@ -3811,6 +3852,7 @@ function filterCards() {{
   document.getElementById('empty').style.display = visible ? 'none' : 'block';
   document.getElementById('visibleCount').textContent = String(visible);
   updateFilterSummary();
+  updateAlphabetNav();
 }}
 
 function resetFilters() {{
