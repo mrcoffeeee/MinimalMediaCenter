@@ -54,9 +54,10 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.1"
+VERSION = "4.15.5"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
+IMDB_GRAPHQL_ENDPOINT = "https://caching.graphql.imdb.com/"
 DEFAULT_OMDB_API_KEY = "fae48dc5"
 OMDB_DAILY_LIMIT = 100000  # Wird beim Start aus config.txt überschrieben.
 DEFAULT_MEDIA_SOURCE = r"\\192.168.2.208\Multimedia"
@@ -100,9 +101,9 @@ def _normalize_app_config(values: dict[str, Any], *, seen_keys: set[str] | None 
         raise CatalogError("Max-Requests muss eine positive ganze Zahl sein.")
 
     language = str(values.get("Startup-Language", DEFAULT_STARTUP_LANGUAGE)).strip().casefold()
-    aliases = {"de": "de", "deutsch": "de", "german": "de", "en": "en", "english": "en", "englisch": "en"}
+    aliases = {"de": "de", "deutsch": "de", "german": "de", "en": "en", "english": "en", "englisch": "en", "es": "es", "espanol": "es", "español": "es", "spanish": "es", "spanisch": "es"}
     if language not in aliases:
-        raise CatalogError("Startup-Language muss de oder en sein.")
+        raise CatalogError("Startup-Language muss de, en oder es sein.")
 
     raw_scan = values.get("Scan-On-Startup", DEFAULT_SCAN_ON_STARTUP)
     if isinstance(raw_scan, bool):
@@ -194,7 +195,7 @@ def save_app_config(values: dict[str, Any]) -> dict[str, Any]:
         "# Media Catalog Configuration",
         "# These values can also be changed from Settings in the web interface.",
         "#",
-        "# Startup-Language: de = German, en = English",
+        "# Startup-Language: de = German, en = English, es = Spanish",
         "# Scan-On-Startup: Yes = scan media folders at startup, No = open the existing database immediately",
         "#",
         "# Path examples:",
@@ -349,6 +350,14 @@ class OmdbTemporaryError(CatalogError):
 
 class OmdbFatalError(CatalogError):
     """Weitere OMDb-Aufrufe sind mit dieser Konfiguration nicht sinnvoll."""
+
+
+class ImdbLocalizationError(CatalogError):
+    """Die lokalisierte IMDb-Abfrage ist vorübergehend nicht verfügbar."""
+
+
+_IMDB_LOCALIZATION_LOCK = threading.Lock()
+_IMDB_LOCALIZATION_LAST_REQUEST_AT = 0.0
 
 
 @dataclass(frozen=True)
@@ -1468,6 +1477,14 @@ def open_database(path: Path) -> sqlite3.Connection:
             kind TEXT NOT NULL,
             source_title TEXT NOT NULL,
             source_year INTEGER,
+            german_title TEXT NOT NULL DEFAULT '',
+            german_title_manual INTEGER NOT NULL DEFAULT 0,
+            german_title_imdb TEXT NOT NULL DEFAULT '',
+            german_plot TEXT NOT NULL DEFAULT '',
+            imdb_de_checked_at TEXT NOT NULL DEFAULT '',
+            spanish_title_imdb TEXT NOT NULL DEFAULT '',
+            spanish_plot TEXT NOT NULL DEFAULT '',
+            imdb_es_checked_at TEXT NOT NULL DEFAULT '',
             imdb_id TEXT NOT NULL DEFAULT '',
             manual_imdb_id TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL,
@@ -1520,6 +1537,27 @@ def open_database(path: Path) -> sqlite3.Connection:
         connection.execute("ALTER TABLE media ADD COLUMN server_added_at TEXT NOT NULL DEFAULT ''")
     if "age_rating" not in columns:
         connection.execute("ALTER TABLE media ADD COLUMN age_rating TEXT NOT NULL DEFAULT ''")
+    if "german_title" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN german_title TEXT NOT NULL DEFAULT ''")
+    if "german_title_manual" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN german_title_manual INTEGER NOT NULL DEFAULT 0")
+    if "german_title_imdb" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN german_title_imdb TEXT NOT NULL DEFAULT ''")
+    if "german_plot" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN german_plot TEXT NOT NULL DEFAULT ''")
+    if "imdb_de_checked_at" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN imdb_de_checked_at TEXT NOT NULL DEFAULT ''")
+    if "spanish_title_imdb" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN spanish_title_imdb TEXT NOT NULL DEFAULT ''")
+    if "spanish_plot" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN spanish_plot TEXT NOT NULL DEFAULT ''")
+    if "imdb_es_checked_at" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN imdb_es_checked_at TEXT NOT NULL DEFAULT ''")
+    # Existing databases keep the locally detected filename/folder title until
+    # the first successful German IMDb localization has been cached.
+    connection.execute(
+        "UPDATE media SET german_title=source_title WHERE TRIM(COALESCE(german_title,''))=''"
+    )
     connection.commit()
     return connection
 
@@ -1660,6 +1698,112 @@ def _metadata_values(
         "status": "nicht zugeordnet" if lookup_attempted else "Metadaten deaktiviert",
     }
 
+
+
+IMDB_DE_TITLE_QUERY = """
+query TitleLocalization($id: ID!) {
+  title(id: $id) {
+    id
+    titleText { text }
+    plot { plotText { plainText } }
+  }
+}
+"""
+
+
+def _imdb_localization_stale(value: str, max_days: int = 180) -> bool:
+    value = str(value or "").strip()
+    if not value:
+        return True
+    try:
+        checked = datetime.fromisoformat(value)
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - checked > timedelta(days=max_days)
+
+
+def lookup_imdb_localization(
+    imdb_id: str,
+    *,
+    language: str,
+    country: str,
+    timeout: int = 15,
+) -> tuple[str, str]:
+    """IMDb display title and plot localized for one language/country pair.
+
+    IMDb's web GraphQL endpoint is queried with the same ``tt...`` id already
+    stored by OMDb. No additional API key is required. Empty strings mean IMDb
+    did not provide a localized value for the requested field.
+    """
+    imdb_id = str(imdb_id or "").strip().lower()
+    if not IMDB_ID_RE.fullmatch(imdb_id):
+        raise CatalogError("Ungültige IMDb-ID für Lokalisierung.")
+
+    locale_map = {
+        "de": ("de-DE", "DE", "de-DE,de;q=0.9,en;q=0.7", "de-DE,de,en-US,en"),
+        "es": ("es-ES", "ES", "es-ES,es;q=0.9,en;q=0.7", "es-ES,es,en-US,en"),
+    }
+    language_key = str(language or "").strip().casefold()
+    if language_key not in locale_map:
+        raise CatalogError(f"Nicht unterstützte IMDb-Lokalisierung: {language}")
+    imdb_language, default_country, accept_language, normalized_languages = locale_map[language_key]
+    imdb_country = str(country or default_country).strip().upper() or default_country
+
+    payload = json.dumps(
+        {"query": IMDB_DE_TITLE_QUERY, "variables": {"id": imdb_id}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    headers = {
+        "Accept": "application/graphql+json, application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.imdb.com",
+        "Referer": "https://www.imdb.com/",
+        "User-Agent": f"medien-katalog/{VERSION}",
+        "Accept-Language": accept_language,
+        "x-imdb-client-name": "imdb-web-next",
+        "x-imdb-user-language": imdb_language,
+        "x-imdb-user-country": imdb_country,
+        "x-imdb-normalized-languages": normalized_languages,
+    }
+
+    global _IMDB_LOCALIZATION_LAST_REQUEST_AT
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with _IMDB_LOCALIZATION_LOCK:
+                wait_for = 0.18 - (time.monotonic() - _IMDB_LOCALIZATION_LAST_REQUEST_AT)
+                if wait_for > 0:
+                    time.sleep(wait_for)
+                request = Request(IMDB_GRAPHQL_ENDPOINT, data=payload, headers=headers, method="POST")
+                with urlopen(request, timeout=timeout) as response:
+                    body = response.read().decode("utf-8")
+                _IMDB_LOCALIZATION_LAST_REQUEST_AT = time.monotonic()
+            data = json.loads(body)
+            title_node = ((data.get("data") or {}).get("title") or {})
+            if not title_node:
+                errors = data.get("errors") or []
+                message = "; ".join(str(e.get("message") or e) for e in errors if isinstance(e, dict))
+                raise ValueError(message or "IMDb lieferte keine Titeldaten")
+            localized_title = str((title_node.get("titleText") or {}).get("text") or "").strip()
+            localized_plot = str((((title_node.get("plot") or {}).get("plotText") or {}).get("plainText")) or "").strip()
+            return localized_title, localized_plot
+        except (HTTPError, URLError, TimeoutError, socket.timeout, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            _IMDB_LOCALIZATION_LAST_REQUEST_AT = time.monotonic()
+            if attempt < 2:
+                time.sleep(0.6 * (2 ** attempt))
+    reason = str(last_error) if last_error else "unbekannter Fehler"
+    raise ImdbLocalizationError(f"IMDb-{language_key.upper()} ist nach drei Versuchen nicht erreichbar ({reason}).")
+
+
+def lookup_imdb_german_localization(imdb_id: str, timeout: int = 15) -> tuple[str, str]:
+    return lookup_imdb_localization(imdb_id, language="de", country="DE", timeout=timeout)
+
+
+def lookup_imdb_spanish_localization(imdb_id: str, timeout: int = 15) -> tuple[str, str]:
+    return lookup_imdb_localization(imdb_id, language="es", country="ES", timeout=timeout)
 
 def lookup_exact_imdb(client: OmdbClient, imdb_id: str) -> dict[str, Any]:
     """Eine vom Benutzer vorgegebene IMDb-ID ohne Titelfuzzy-Matching auflösen."""
@@ -1903,6 +2047,8 @@ def scan_into_database(
     client = None if args.ohne_metadaten else OmdbClient(omdb_key, args.cache, args.cache_tage)
     omdb_available = client is not None
     omdb_error = ""
+    imdb_de_available = True
+    imdb_es_available = True
     scan_id = _utc_now()
     connection = open_database(args.db)
     try:
@@ -2024,17 +2170,86 @@ def scan_into_database(
             created_at = str(old_row["created_at"]) if old_row else now
             previous_server_added = str(old_row["server_added_at"] or "") if old_row else ""
             server_added_at = _server_added_at(item.paths, previous_server_added, created_at)
+            german_title_manual = int(old_row["german_title_manual"]) if old_row else 0
+            german_title_imdb = str(old_row["german_title_imdb"] or "") if old_row else ""
+            german_plot = str(old_row["german_plot"] or "") if old_row else ""
+            imdb_de_checked_at = str(old_row["imdb_de_checked_at"] or "") if old_row else ""
+            spanish_title_imdb = str(old_row["spanish_title_imdb"] or "") if old_row else ""
+            spanish_plot = str(old_row["spanish_plot"] or "") if old_row else ""
+            imdb_es_checked_at = str(old_row["imdb_es_checked_at"] or "") if old_row else ""
+            current_imdb_id = str(values.get("imdb_id") or "").strip().lower()
+            previous_imdb_id = str(old_row["imdb_id"] or "").strip().lower() if old_row else ""
+            if previous_imdb_id and current_imdb_id != previous_imdb_id:
+                german_title_imdb = ""
+                german_plot = ""
+                imdb_de_checked_at = ""
+                spanish_title_imdb = ""
+                spanish_plot = ""
+                imdb_es_checked_at = ""
+
+            if (
+                imdb_de_available
+                and IMDB_ID_RE.fullmatch(current_imdb_id)
+                and _imdb_localization_stale(imdb_de_checked_at)
+            ):
+                if not args.ruhig:
+                    print(f"IMDb-DE {index}/{len(items)}: {item.title}", file=sys.stderr)
+                try:
+                    localized_title, localized_plot = lookup_imdb_german_localization(current_imdb_id)
+                    german_title_imdb = localized_title
+                    german_plot = localized_plot
+                    imdb_de_checked_at = _utc_now()
+                except ImdbLocalizationError as exc:
+                    imdb_de_available = False
+                    print(
+                        f"Warnung: {exc} Weitere deutsche IMDb-Abfragen werden für diesen Scan übersprungen.",
+                        file=sys.stderr,
+                    )
+
+            if (
+                imdb_es_available
+                and IMDB_ID_RE.fullmatch(current_imdb_id)
+                and _imdb_localization_stale(imdb_es_checked_at)
+            ):
+                if not args.ruhig:
+                    print(f"IMDb-ES {index}/{len(items)}: {item.title}", file=sys.stderr)
+                try:
+                    localized_title_es, localized_plot_es = lookup_imdb_spanish_localization(current_imdb_id)
+                    spanish_title_imdb = localized_title_es
+                    spanish_plot = localized_plot_es
+                    imdb_es_checked_at = _utc_now()
+                except ImdbLocalizationError as exc:
+                    imdb_es_available = False
+                    print(
+                        f"Warnung: {exc} Weitere spanische IMDb-Abfragen werden für diesen Scan übersprungen.",
+                        file=sys.stderr,
+                    )
+
+            if old_row and german_title_manual:
+                german_title = str(old_row["german_title"] or item.title)
+            else:
+                german_title = german_title_imdb or item.title or str(values.get("title") or "")
             connection.execute(
                 """
                 INSERT INTO media(
-                    scan_key, kind, source_title, source_year, imdb_id, manual_imdb_id,
+                    scan_key, kind, source_title, source_year, german_title, german_title_manual,
+                    german_title_imdb, german_plot, imdb_de_checked_at,
+                    spanish_title_imdb, spanish_plot, imdb_es_checked_at, imdb_id, manual_imdb_id,
                     title, year, imdb_rating, plot, poster, genre, director, actors, runtime, age_rating, status,
                     is_kids, kids_manual, file_count, paths_json, server_added_at, last_seen_scan, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scan_key) DO UPDATE SET
                     kind=excluded.kind,
                     source_title=excluded.source_title,
                     source_year=excluded.source_year,
+                    german_title=excluded.german_title,
+                    german_title_manual=excluded.german_title_manual,
+                    german_title_imdb=excluded.german_title_imdb,
+                    german_plot=excluded.german_plot,
+                    imdb_de_checked_at=excluded.imdb_de_checked_at,
+                    spanish_title_imdb=excluded.spanish_title_imdb,
+                    spanish_plot=excluded.spanish_plot,
+                    imdb_es_checked_at=excluded.imdb_es_checked_at,
                     imdb_id=excluded.imdb_id,
                     title=excluded.title,
                     year=excluded.year,
@@ -2060,6 +2275,14 @@ def scan_into_database(
                     item.kind,
                     item.title,
                     item.year,
+                    german_title,
+                    german_title_manual,
+                    german_title_imdb,
+                    german_plot,
+                    imdb_de_checked_at,
+                    spanish_title_imdb,
+                    spanish_plot,
+                    imdb_es_checked_at,
                     values["imdb_id"],
                     manual_imdb_id,
                     values["title"],
@@ -2157,11 +2380,33 @@ def correct_database_item(
         plot = str(metadata.get("Plot") or "Keine Kurzbeschreibung vorhanden.")
         if plot == "N/A":
             plot = "Keine Kurzbeschreibung vorhanden."
+        localized_title = ""
+        localized_plot = ""
+        localized_checked_at = ""
+        try:
+            localized_title, localized_plot = lookup_imdb_german_localization(imdb_id)
+            localized_checked_at = _utc_now()
+        except ImdbLocalizationError as exc:
+            print(f"Warnung bei deutscher IMDb-Lokalisierung für {imdb_id}: {exc}", file=sys.stderr)
+        localized_title_es = ""
+        localized_plot_es = ""
+        localized_checked_at_es = ""
+        try:
+            localized_title_es, localized_plot_es = lookup_imdb_spanish_localization(imdb_id)
+            localized_checked_at_es = _utc_now()
+        except ImdbLocalizationError as exc:
+            print(f"Warnung bei spanischer IMDb-Lokalisierung für {imdb_id}: {exc}", file=sys.stderr)
         auto_kids = _auto_kids_from_metadata(metadata)
+        german_title_manual = bool(row["german_title_manual"])
+        german_title = str(row["german_title"] or "") if german_title_manual else (
+            localized_title or str(row["source_title"] or metadata.get("Title") or "")
+        )
         connection.execute(
             """
             UPDATE media SET
                 manual_imdb_id=?, imdb_id=?, title=?, year=?, imdb_rating=?, plot=?,
+                german_title=?, german_title_imdb=?, german_plot=?, imdb_de_checked_at=?,
+                spanish_title_imdb=?, spanish_plot=?, imdb_es_checked_at=?,
                 poster=?, genre=?, director=?, actors=?, runtime=?, age_rating=?, status='manuell zugeordnet',
                 is_kids=CASE WHEN kids_manual=1 THEN is_kids ELSE ? END, updated_at=?
             WHERE id=?
@@ -2173,6 +2418,13 @@ def correct_database_item(
                 str(metadata.get("Year") or row["source_year"] or "–"),
                 rating,
                 plot,
+                german_title,
+                localized_title,
+                localized_plot,
+                localized_checked_at,
+                localized_title_es,
+                localized_plot_es,
+                localized_checked_at_es,
                 poster,
                 "" if metadata.get("Genre") == "N/A" else str(metadata.get("Genre") or ""),
                 "" if metadata.get("Director") == "N/A" else str(metadata.get("Director") or ""),
@@ -2206,6 +2458,47 @@ def set_kids_flag(args: argparse.Namespace, media_id: int, is_kids: bool) -> Non
         connection.commit()
     finally:
         connection.close()
+
+
+def set_german_title(args: argparse.Namespace, media_id: int, value: str) -> str:
+    """Store a manually corrected German display title for a catalog item."""
+    german_title = " ".join(str(value or "").split()).strip(" ._-–—")
+    if not german_title:
+        raise CatalogError("Der deutsche Titel darf nicht leer sein.")
+    if len(german_title) > 300:
+        raise CatalogError("Der deutsche Titel ist zu lang.")
+    connection = open_database(args.db)
+    try:
+        cursor = connection.execute(
+            "UPDATE media SET german_title=?, german_title_manual=1, updated_at=? WHERE id=?",
+            (german_title, _utc_now(), media_id),
+        )
+        if cursor.rowcount == 0:
+            raise CatalogError("Der Katalogeintrag existiert nicht mehr.")
+        connection.commit()
+    finally:
+        connection.close()
+    return german_title
+
+
+def reset_german_title(args: argparse.Namespace, media_id: int) -> str:
+    """Restore the automatically localized German IMDb title, with local fallback."""
+    connection = open_database(args.db)
+    try:
+        row = connection.execute(
+            "SELECT german_title_imdb, source_title, title FROM media WHERE id=?", (media_id,)
+        ).fetchone()
+        if row is None:
+            raise CatalogError("Der Katalogeintrag existiert nicht mehr.")
+        german_title = str(row["german_title_imdb"] or row["source_title"] or row["title"] or "").strip()
+        connection.execute(
+            "UPDATE media SET german_title=?, german_title_manual=0, updated_at=? WHERE id=?",
+            (german_title, _utc_now(), media_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return german_title
 
 
 def reset_database_item_mapping(args: argparse.Namespace, media_id: int) -> None:
@@ -2749,7 +3042,7 @@ def generate_catalog_pdf(
     if not rows:
         raise CatalogError("Die ausgewählten Titel existieren nicht mehr in der Datenbank.")
 
-    lang = "en" if language == "en" else "de"
+    lang = language if language in {"de", "en", "es"} else "de"
     text = {
         "de": {
             "title": "Medienkatalog - IMDb-Liste",
@@ -2788,6 +3081,25 @@ def generate_catalog_pdf(
             "no_cover": "No cover",
             "unrated": "not rated",
             "page": "Page",
+        },
+        "es": {
+            "title": "Catálogo multimedia - Lista IMDb",
+            "created": "Creado",
+            "count": "títulos",
+            "movies": "películas",
+            "series": "series",
+            "movie": "Película",
+            "serie": "Serie",
+            "rating": "IMDb",
+            "genre": "Género",
+            "runtime": "Duración",
+            "director": "Dirección",
+            "cast": "Reparto",
+            "age_rating": "Clasificación por edad",
+            "plot": "Sinopsis",
+            "no_cover": "Sin carátula",
+            "unrated": "sin valoración",
+            "page": "Página",
         },
     }[lang]
 
@@ -2957,14 +3269,20 @@ def generate_catalog_pdf(
         kind_label = text["movie"] if str(row["kind"]) == "movie" else text["serie"]
         year = str(row["year"] or "").strip()
         year_suffix = f" ({esc(year)})" if year and year != "–" else ""
+        if lang == "de":
+            display_title = str(row["german_title"] or row["german_title_imdb"] or row["source_title"] or row["title"])
+        elif lang == "es":
+            display_title = str(row["spanish_title_imdb"] or row["title"] or row["source_title"])
+        else:
+            display_title = str(row["title"] or row["source_title"])
         right_story: list[Any] = [
-            Paragraph(f"{index}. [{esc(kind_label)}] {esc(row['title'])}{year_suffix}", heading_style),
+            Paragraph(f"{index}. [{esc(kind_label)}] {esc(display_title)}{year_suffix}", heading_style),
             RatingGraphic(str(row["imdb_rating"] or "")),
             Spacer(1, 0.6 * mm),
         ]
 
         facts: list[str] = []
-        genre = str(row["genre"] or "").strip()
+        genre = localized_genre_text(str(row["genre"] or "").strip(), language)
         if genre:
             facts.append(f'<b>{esc(text["genre"])}:</b> {esc(shortened(genre, 120))}')
         runtime = str(row["runtime"] or "").strip()
@@ -2981,7 +3299,7 @@ def generate_catalog_pdf(
         actors = str(row["actors"] or "").strip()
         if actors:
             right_story.append(Paragraph(f'<b>{esc(text["cast"])}:</b> {esc(shortened(actors, 260))}', info_style))
-        plot = str(row["plot"] or "").strip()
+        plot = str((row["german_plot"] if lang == "de" else (row["spanish_plot"] if lang == "es" else row["plot"])) or row["plot"] or "").strip()
         if plot:
             right_story.append(Paragraph(f'<b>{esc(text["plot"])}:</b> {esc(shortened(plot, 620))}', plot_style))
 
@@ -3115,6 +3433,35 @@ def start_media(args: argparse.Namespace, media_id: int) -> str:
     return target
 
 
+GERMAN_GENRE_NAMES = {
+    "Action": "Action", "Adventure": "Abenteuer", "Animation": "Animation", "Biography": "Biografie",
+    "Comedy": "Komödie", "Crime": "Krimi", "Documentary": "Dokumentation", "Drama": "Drama",
+    "Family": "Familie", "Fantasy": "Fantasy", "Film-Noir": "Film Noir", "Game-Show": "Spielshow",
+    "History": "Geschichte", "Horror": "Horror", "Music": "Musik", "Musical": "Musical",
+    "Mystery": "Mystery", "News": "Nachrichten", "Reality-TV": "Reality-TV", "Romance": "Liebesfilm",
+    "Sci-Fi": "Science-Fiction", "Short": "Kurzfilm", "Sport": "Sport", "Talk-Show": "Talkshow",
+    "Thriller": "Thriller", "War": "Krieg", "Western": "Western",
+}
+
+SPANISH_GENRE_NAMES = {
+    "Action": "Acción", "Adventure": "Aventura", "Animation": "Animación", "Biography": "Biografía",
+    "Comedy": "Comedia", "Crime": "Crimen", "Documentary": "Documental", "Drama": "Drama",
+    "Family": "Familiar", "Fantasy": "Fantasía", "Film-Noir": "Cine negro", "Game-Show": "Concurso",
+    "History": "Historia", "Horror": "Terror", "Music": "Música", "Musical": "Musical",
+    "Mystery": "Misterio", "News": "Noticias", "Reality-TV": "Telerrealidad", "Romance": "Romance",
+    "Sci-Fi": "Ciencia ficción", "Short": "Cortometraje", "Sport": "Deporte", "Talk-Show": "Talk show",
+    "Thriller": "Suspense", "War": "Bélico", "Western": "Western",
+}
+
+def localized_genre_text(value: str, language: str) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    if language == "de":
+        return ", ".join(GERMAN_GENRE_NAMES.get(part, part) for part in parts)
+    if language == "es":
+        return ", ".join(SPANISH_GENRE_NAMES.get(part, part) for part in parts)
+    return ", ".join(parts)
+
+
 def _age_rating_badge_meta(value: str) -> tuple[str, str, str]:
     """Age-rating badge styling for the web UI.
 
@@ -3169,7 +3516,7 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         actor_names.update(part.strip() for part in str(row["actors"] or "").split(",") if part.strip())
 
     genre_options = "".join(
-        f'<option value="{html.escape(name.casefold(), quote=True)}">{html.escape(name)}</option>'
+        f'<option value="{html.escape(name.casefold(), quote=True)}" data-genre-name="{html.escape(name, quote=True)}">{html.escape(name)}</option>'
         for name in sorted(genre_names, key=str.casefold)
     )
     director_options = "".join(
@@ -3183,11 +3530,18 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
 
     cards: list[str] = []
     for card_order, row in enumerate(rows):
-        title = html.escape(str(row["title"]))
+        title_raw = str(row["title"] or row["source_title"] or "")
+        german_title_raw = str(row["german_title"] or row["source_title"] or title_raw)
+        spanish_title_raw = str(row["spanish_title_imdb"] or title_raw)
+        title = html.escape(title_raw)
+        german_title = html.escape(german_title_raw)
         source_title = html.escape(str(row["source_title"]))
         year = html.escape(str(row["year"]))
         rating = html.escape(str(row["imdb_rating"]))
-        plot = html.escape(str(row["plot"] or ""))
+        plot_en_raw = str(row["plot"] or "")
+        plot_de_raw = str(row["german_plot"] or plot_en_raw)
+        plot_es_raw = str(row["spanish_plot"] or plot_en_raw)
+        plot = html.escape(plot_de_raw)
         genre_raw = str(row["genre"] or "")
         director_raw = str(row["director"] or "")
         actors_raw = str(row["actors"] or "")
@@ -3227,6 +3581,12 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
             if IMDB_ID_RE.fullmatch(imdb_id)
             else ""
         )
+        trailer_html = (
+            '<a class="trailer-link" href="#" target="_blank" rel="noreferrer" data-i18n="searchTrailer" '
+            f'data-trailer-year="{html.escape(str(row["year"] or ""), quote=True)}">Trailer suchen</a>'
+            if (title_raw or german_title_raw)
+            else ""
+        )
         # IMDb-Suche wird serverseitig über IMDbs eigenen Suggestion-Dienst
         # ausgeführt. So kann die Trefferliste direkt in der Karte erscheinen,
         # ohne OMDb-Kontingent zu verbrauchen.
@@ -3263,9 +3623,12 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
             f"""
             <article class="card" id="media-{int(row['id'])}"
               data-media-id="{int(row['id'])}"
-              data-title="{html.escape(str(row['title']), quote=True)}"
+              data-title="{html.escape(title_raw, quote=True)}"
+              data-title-en="{html.escape(title_raw, quote=True)}"
+              data-title-de="{html.escape(german_title_raw, quote=True)}"
+              data-title-es="{html.escape(spanish_title_raw, quote=True)}"
               data-year="{html.escape(str(row['year'] or ''), quote=True)}"
-              data-search="{html.escape((str(row['title'])+' '+str(row['source_title'])+' '+str(row['year'])+' '+genre_raw+' '+director_raw+' '+actors_raw+' '+str(row['age_rating'] or '')).casefold(), quote=True)}"
+              data-search="{html.escape((title_raw+' '+german_title_raw+' '+spanish_title_raw+' '+str(row['source_title'])+' '+str(row['year'])+' '+genre_raw+' '+director_raw+' '+actors_raw+' '+str(row['age_rating'] or '')).casefold(), quote=True)}"
               data-genres="{html.escape(json.dumps(genre_values, ensure_ascii=False), quote=True)}"
               data-directors="{html.escape(json.dumps(director_values, ensure_ascii=False), quote=True)}"
               data-actors="{html.escape(json.dumps(actor_values, ensure_ascii=False), quote=True)}"
@@ -3277,18 +3640,23 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
               {poster_html}
               <div class="content">
                 <div class="topline"><span class="kind" data-kind-code="{html.escape(str(row['kind']), quote=True)}">{'Film' if row['kind']=='movie' else 'Serie'}</span><span class="badges">{'<span class="kids-badge" data-i18n="kidsBadge">Kinder</span>' if is_kids else ''}<span class="status" data-status-code="{html.escape(status_code, quote=True)}">{html.escape('Manuell' if manual else status_raw)}</span></span></div>
-                <h2>{title} <small>{year}</small></h2>
+                <h2><span class="localized-title">{german_title}</span> <small>{year}</small></h2>
                 <div class="rating">★ {rating}<span>/10</span></div>
-                <div class="facts">{genre}{' · ' if genre and runtime else ''}{runtime}</div>
+                <div class="facts"><span class="genre-text" data-genre-raw="{html.escape(genre_raw, quote=True)}">{genre}</span>{' · ' if genre and runtime else ''}{runtime}</div>
                 <div class="facts age-rating"><span class="age-label" data-i18n="ageRatingLabel">FSK/Rating</span>: <span class="age-badge age-{age_badge_class}" title="{age_badge_hint_html}">{age_badge_text_html}</span></div>
                 {f'<div class="facts added-date"><span data-i18n="addedLabel">Auf Server</span>: {html.escape(server_added_display)}</div>' if server_added_display else ''}
                 {f'<div class="facts director"><span data-i18n="directorLabel">Regie</span>: {director}</div>' if director else ''}
                 {f'<div class="facts actors"><span data-i18n="castLabel">Besetzung</span>: {actors}</div>' if actors else ''}
-                <p>{plot}</p>
-                <div class="links">{imdb_html}<button class="play-button" type="button" onclick="startMedia({int(row['id'])}, this, '{'series' if str(row['kind']) == 'series' else 'movie'}')" data-i18n="{'openFolder' if str(row['kind']) == 'series' else 'playFilm'}">{'Ordner öffnen' if str(row['kind']) == 'series' else 'Film starten'}</button><span>{int(row['file_count'])} <span data-i18n="files">Datei(en)</span></span></div>
+                <p class="localized-plot" data-plot-en="{html.escape(plot_en_raw, quote=True)}" data-plot-de="{html.escape(plot_de_raw, quote=True)}" data-plot-es="{html.escape(plot_es_raw, quote=True)}">{plot}</p>
+                <div class="links">{imdb_html}{trailer_html}<button class="play-button" type="button" onclick="startMedia({int(row['id'])}, this, '{'series' if str(row['kind']) == 'series' else 'movie'}')" data-i18n="{'openFolder' if str(row['kind']) == 'series' else 'playFilm'}">{'Ordner öffnen' if str(row['kind']) == 'series' else 'Film starten'}</button><span>{int(row['file_count'])} <span data-i18n="files">Datei(en)</span></span></div>
                 <details>
                   <summary data-i18n="sourceCorrection">Quelle &amp; Korrektur</summary>
                   <p class="detected"><span data-i18n="detectedAs">Erkannt als</span>: <strong>{source_title}</strong>{' ('+html.escape(str(row['source_year']))+')' if row['source_year'] else ''}</p>
+                  <form method="post" action="/german-title/{int(row['id'])}" class="correction german-title-form" onsubmit="saveViewState(this)">
+                    <input name="german_title" value="{html.escape(german_title_raw, quote=True)}" placeholder="Deutscher Titel" data-i18n-placeholder="germanTitlePlaceholder" required>
+                    <button type="submit" data-i18n="saveGermanTitle">Deutschen Titel speichern</button>
+                  </form>
+                  {f'<form method="post" action="/german-title-reset/{int(row["id"])}" class="german-title-reset" onsubmit="saveViewState(this)"><button class="secondary" type="submit" data-i18n="resetGermanTitle">Deutschen Titel zurücksetzen</button></form>' if bool(row['german_title_manual']) else ''}
                   <ul class="paths">{paths_html}</ul>
                   {imdb_search_html}
                   <form method="post" action="/correct/{int(row['id'])}" class="correction" onsubmit="saveViewState(this)">
@@ -3401,6 +3769,8 @@ main {{ padding:24px max(18px,4vw) 50px; }}
 .age-neutral {{ color:#c5ccd6; background:rgba(99,108,121,.10); border-color:rgba(126,136,150,.32); }}
 .age-unknown {{ color:#9da5b1; background:rgba(83,91,103,.08); border-color:rgba(112,121,134,.25); }}
 p {{ margin:8px 0; line-height:1.4; }} .links {{ display:flex; gap:12px; margin-top:auto; padding-top:10px; }} a {{ color:#8bc2ff; }}
+.trailer-link {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:7px; border:1px solid #704248; background:#392327; color:#ffb7bd; text-decoration:none; font-weight:700; }}
+.trailer-link:hover {{ background:#4a2b30; color:#ffd2d6; }}
 .play-button {{ background:var(--play); color:#07140c; border:1px solid #63e8a0; padding:6px 11px; font-size:.8rem; box-shadow:0 2px 10px rgba(54,201,120,.18); }}
 .play-button:hover {{ background:var(--play-hover); }} .play-button:disabled {{ opacity:.6; cursor:default; }}
 .reset-filters {{ background:#252b35; color:#dfe4ec; border:1px solid #39414d; white-space:nowrap; }} .reset-filters:hover {{ background:#303845; }} details {{ margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }} summary {{ cursor:pointer; color:#cdd3dd; }}
@@ -3484,6 +3854,7 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
       <select id="languageSelect" onchange="changeLanguage()" aria-label="Sprache / Language">
         <option value="de">DE</option>
         <option value="en">EN</option>
+        <option value="es">ES</option>
       </select>
     </div>
   </div>
@@ -3576,7 +3947,7 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
         <input id="cfgMaxRequests" type="number" min="1" step="1">
 
         <label for="cfgStartupLanguage" data-i18n="cfgStartupLanguage">Startsprache</label>
-        <select id="cfgStartupLanguage"><option value="de">Deutsch</option><option value="en">English</option></select>
+        <select id="cfgStartupLanguage"><option value="de">Deutsch</option><option value="en">English</option><option value="es">Español</option></select>
 
         <label for="cfgScanStartup" data-i18n="cfgScanStartup">Scan beim Start</label>
         <select id="cfgScanStartup"><option value="yes" data-i18n="yes">Ja</option><option value="no" data-i18n="no">Nein</option></select>
@@ -3599,7 +3970,7 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
 <script>
 const VIEW_STATE_KEY = 'medienkatalog-view-v1';
 const LANGUAGE_KEY = 'medienkatalog-language-session-v1';
-const CONFIG_STARTUP_LANGUAGE = {json.dumps(str(getattr(args, 'startup_language', 'de')) if str(getattr(args, 'startup_language', 'de')) in {'de','en'} else 'de')};
+const CONFIG_STARTUP_LANGUAGE = {json.dumps(str(getattr(args, 'startup_language', 'de')) if str(getattr(args, 'startup_language', 'de')) in {'de','en','es'} else 'de')};
 let activeLanguage = CONFIG_STARTUP_LANGUAGE;
 const I18N = {{
   de: {{
@@ -3614,7 +3985,7 @@ const I18N = {{
     resetFilters:'Zurücksetzen', refreshLibrary:'Bibliothek aktualisieren', settings:'Einstellungen', settingsTitle:'Konfiguration', cfgApiKey:'OMDb API-Key', cfgMaxRequests:'Max. Requests pro Tag', cfgStartupLanguage:'Startsprache', cfgScanStartup:'Scan beim Start', cfgMoviesPath:'Pfad Filme', cfgSeriesPath:'Pfad Serien', configNote:'Änderungen werden in config.txt neben dem Python-Skript gespeichert. Neue Pfade gelten beim nächsten Bibliotheks-Scan.', saveConfig:'Speichern', savingConfig:'Speichere …', configSaved:'Konfiguration gespeichert.', configLoadFailed:'Konfiguration konnte nicht geladen werden.', configSaveFailed:'Konfiguration konnte nicht gespeichert werden.', cancel:'Abbrechen', yes:'Ja', no:'Nein', exportPdf:'PDF-Liste erstellen', pdfCreating:'PDF wird erstellt …', pdfFailed:'PDF konnte nicht erstellt werden.', noPdfTitles:'Keine sichtbaren Titel für den PDF-Export.', source:'Quelle',
     lastScan:'letzter Scan', serverDates:'Serverdaten', calls:'Aufrufe', fromDb:'aus DB', omdbNotice:'OMDb-Hinweis',
     todayUsage:'heute lokal gezählt', remainingApprox:'ca. verbleibend', filmServer:'Filmserver', online:'online', offline:'offline', checking:'prüfe …',
-    noMatches:'Keine passenden Titel.', noCover:'Kein Cover', openIMDb:'IMDb öffnen',
+    noMatches:'Keine passenden Titel.', noCover:'Kein Cover', openIMDb:'IMDb öffnen', searchTrailer:'Trailer suchen',
     searchIMDb:'Auf IMDb suchen', imdbSearchHint:'Bis zu 10 IMDb-Treffer anzeigen und direkt zuweisen.',
     imdbSearching:'IMDb wird durchsucht …', imdbNoResults:'Keine IMDb-Treffer gefunden.', imdbSearchFailed:'IMDb-Suche fehlgeschlagen.', assignIMDb:'Zuweisen',
     kidsBadge:'Kinder', ageRatingLabel:'FSK/Rating', directorLabel:'Regie', castLabel:'Besetzung', playFilm:'Film starten', openFolder:'Ordner öffnen',
@@ -3625,7 +3996,8 @@ const I18N = {{
     removeManualMapping:'Manuelle Zuordnung entfernen', scanning:'Bibliothek wird aktualisiert …',
     scanFailed:'Bibliothek konnte nicht aktualisiert werden.', starting:'Öffne …', started:'Geöffnet',
     playFailed:'Medienaktion konnte nicht ausgeführt werden.', randomMovie:'Zufälliger Film',
-    randomMovieTitle:'Dein Zufallsfilm', anotherRandom:'Noch einen', close:'Schließen', noMovies:'Keine Filme in der Bibliothek gefunden.'
+    randomMovieTitle:'Dein Zufallsfilm', anotherRandom:'Noch einen', close:'Schließen', noMovies:'Keine Filme in der Bibliothek gefunden.',
+    germanTitlePlaceholder:'Deutscher Titel', saveGermanTitle:'Deutschen Titel speichern', resetGermanTitle:'Deutschen Titel zurücksetzen'
   }},
   en: {{
     pageTitle:'Media Library', catalogTitle:'Media Library', titles:'titles', filters:'Filters',
@@ -3639,7 +4011,7 @@ const I18N = {{
     resetFilters:'Reset', refreshLibrary:'Update library', settings:'Settings', settingsTitle:'Configuration', cfgApiKey:'OMDb API key', cfgMaxRequests:'Max. requests per day', cfgStartupLanguage:'Startup language', cfgScanStartup:'Scan on startup', cfgMoviesPath:'Movies path', cfgSeriesPath:'Series path', configNote:'Changes are saved to config.txt next to the Python script. New paths apply to the next library scan.', saveConfig:'Save', savingConfig:'Saving …', configSaved:'Configuration saved.', configLoadFailed:'Configuration could not be loaded.', configSaveFailed:'Configuration could not be saved.', cancel:'Cancel', yes:'Yes', no:'No', exportPdf:'Create PDF list', pdfCreating:'Creating PDF …', pdfFailed:'PDF could not be created.', noPdfTitles:'No visible titles to export to PDF.', source:'Source',
     lastScan:'last scan', serverDates:'server dates', calls:'requests', fromDb:'from DB', omdbNotice:'OMDb notice',
     todayUsage:'locally counted today', remainingApprox:'approx. remaining', filmServer:'Movie server', online:'online', offline:'offline', checking:'checking …',
-    noMatches:'No matching titles.', noCover:'No cover', openIMDb:'Open IMDb',
+    noMatches:'No matching titles.', noCover:'No cover', openIMDb:'Open IMDb', searchTrailer:'Search trailer',
     searchIMDb:'Search IMDb', imdbSearchHint:'Show up to 10 IMDb results and assign one directly.',
     imdbSearching:'Searching IMDb …', imdbNoResults:'No IMDb results found.', imdbSearchFailed:'IMDb search failed.', assignIMDb:'Assign',
     kidsBadge:'Kids', ageRatingLabel:'Age rating', directorLabel:'Director', castLabel:'Cast', playFilm:'Play', openFolder:'Open folder',
@@ -3650,12 +4022,66 @@ const I18N = {{
     removeManualMapping:'Remove manual match', scanning:'Updating library …',
     scanFailed:'Library could not be updated.', starting:'Opening …', started:'Opened',
     playFailed:'Media action could not be completed.', randomMovie:'Random movie',
-    randomMovieTitle:'Your random movie', anotherRandom:'Another one', close:'Close', noMovies:'No movies found in the library.'
+    randomMovieTitle:'Your random movie', anotherRandom:'Another one', close:'Close', noMovies:'No movies found in the library.',
+    germanTitlePlaceholder:'German title', saveGermanTitle:'Save German title', resetGermanTitle:'Reset German title'
+  }},
+  es: {{
+    pageTitle:'Catálogo multimedia', catalogTitle:'Catálogo multimedia', titles:'títulos', filters:'Filtros',
+    searchPlaceholder:'Filtrar por título, año, género, director o actor …',
+    filenamePlaceholder:'El nombre de archivo contiene …',
+    allTitles:'Todos los títulos', moviesOnly:'Solo películas', seriesOnly:'Solo series', kidsAll:'Infantil: todo',
+    kidsMovies:'Películas infantiles', kidsSeries:'Series infantiles', unknown:'Desconocido / sin asignar',
+    allGenres:'Todos los géneros', allDirectors:'Todos los directores', allActors:'Todos los actores',
+    allAddedDates:'Todas las fechas', last7Days:'Añadidos en los últimos 7 días', last30Days:'Añadidos en los últimos 30 días',
+    last90Days:'Añadidos en los últimos 90 días', last365Days:'Añadidos en el último año', addedLabel:'En el servidor',
+    resetFilters:'Restablecer', refreshLibrary:'Actualizar biblioteca', settings:'Ajustes', settingsTitle:'Configuración', cfgApiKey:'Clave API de OMDb', cfgMaxRequests:'Máx. solicitudes por día', cfgStartupLanguage:'Idioma inicial', cfgScanStartup:'Escanear al iniciar', cfgMoviesPath:'Ruta de películas', cfgSeriesPath:'Ruta de series', configNote:'Los cambios se guardan en config.txt junto al script de Python. Las nuevas rutas se aplican en el próximo escaneo de la biblioteca.', saveConfig:'Guardar', savingConfig:'Guardando …', configSaved:'Configuración guardada.', configLoadFailed:'No se pudo cargar la configuración.', configSaveFailed:'No se pudo guardar la configuración.', cancel:'Cancelar', yes:'Sí', no:'No', exportPdf:'Crear lista PDF', pdfCreating:'Creando PDF …', pdfFailed:'No se pudo crear el PDF.', noPdfTitles:'No hay títulos visibles para exportar a PDF.', source:'Fuente',
+    lastScan:'último escaneo', serverDates:'fechas del servidor', calls:'solicitudes', fromDb:'de la BD', omdbNotice:'Aviso de OMDb',
+    todayUsage:'contado localmente hoy', remainingApprox:'aprox. restantes', filmServer:'Servidor multimedia', online:'en línea', offline:'sin conexión', checking:'comprobando …',
+    noMatches:'No hay títulos coincidentes.', noCover:'Sin carátula', openIMDb:'Abrir IMDb', searchTrailer:'Buscar tráiler',
+    searchIMDb:'Buscar en IMDb', imdbSearchHint:'Mostrar hasta 10 resultados de IMDb y asignar uno directamente.',
+    imdbSearching:'Buscando en IMDb …', imdbNoResults:'No se encontraron resultados en IMDb.', imdbSearchFailed:'Falló la búsqueda en IMDb.', assignIMDb:'Asignar',
+    kidsBadge:'Infantil', ageRatingLabel:'Clasificación por edad', directorLabel:'Dirección', castLabel:'Reparto', playFilm:'Reproducir película', openFolder:'Abrir carpeta',
+    files:'archivo(s)', sourceCorrection:'Fuente y corrección', detectedAs:'Detectado como',
+    correctionPlaceholder:'URL de IMDb/OMDb o tt1234567', correctMapping:'Corregir asignación',
+    removeKids:'Quitar etiqueta infantil', markKids:'Marcar como contenido infantil',
+    manualFixed:'establecido manualmente', autoDetected:'detectado automáticamente',
+    removeManualMapping:'Eliminar asignación manual', scanning:'Actualizando biblioteca …',
+    scanFailed:'No se pudo actualizar la biblioteca.', starting:'Abriendo …', started:'Abierto',
+    playFailed:'No se pudo completar la acción multimedia.', randomMovie:'Película aleatoria',
+    randomMovieTitle:'Tu película aleatoria', anotherRandom:'Otra', close:'Cerrar', noMovies:'No se encontraron películas en la biblioteca.',
+    germanTitlePlaceholder:'Título alemán', saveGermanTitle:'Guardar título alemán', resetGermanTitle:'Restablecer título alemán'
   }}
 }};
+const GENRE_DE = {{
+  'Action':'Action','Adventure':'Abenteuer','Animation':'Animation','Biography':'Biografie',
+  'Comedy':'Komödie','Crime':'Krimi','Documentary':'Dokumentation','Drama':'Drama',
+  'Family':'Familie','Fantasy':'Fantasy','Film-Noir':'Film Noir','Game-Show':'Spielshow',
+  'History':'Geschichte','Horror':'Horror','Music':'Musik','Musical':'Musical',
+  'Mystery':'Mystery','News':'Nachrichten','Reality-TV':'Reality-TV','Romance':'Liebesfilm',
+  'Sci-Fi':'Science-Fiction','Short':'Kurzfilm','Sport':'Sport','Talk-Show':'Talkshow',
+  'Thriller':'Thriller','War':'Krieg','Western':'Western'
+}};
+const GENRE_ES = {{
+  'Action':'Acción','Adventure':'Aventura','Animation':'Animación','Biography':'Biografía',
+  'Comedy':'Comedia','Crime':'Crimen','Documentary':'Documental','Drama':'Drama',
+  'Family':'Familiar','Fantasy':'Fantasía','Film-Noir':'Cine negro','Game-Show':'Concurso',
+  'History':'Historia','Horror':'Terror','Music':'Música','Musical':'Musical',
+  'Mystery':'Misterio','News':'Noticias','Reality-TV':'Telerrealidad','Romance':'Romance',
+  'Sci-Fi':'Ciencia ficción','Short':'Cortometraje','Sport':'Deporte','Talk-Show':'Talk show',
+  'Thriller':'Suspense','War':'Bélico','Western':'Western'
+}};
+
+function localizedGenreList(raw) {{
+  const parts = String(raw || '').split(',').map(part => part.trim()).filter(Boolean);
+  if (activeLanguage === 'de') return parts.map(part => GENRE_DE[part] || part).join(', ');
+  if (activeLanguage === 'es') return parts.map(part => GENRE_ES[part] || part).join(', ');
+  return parts.join(', ');
+}}
+
 const STATUS_I18N = {{
   de: {{ 'manual':'Manuell', 'gefunden':'gefunden', 'nicht zugeordnet':'nicht zugeordnet', 'metadaten deaktiviert':'Metadaten deaktiviert', 'manuell zugeordnet':'Manuell' }},
-  en: {{ 'manual':'Manual', 'gefunden':'found', 'nicht zugeordnet':'not matched', 'metadaten deaktiviert':'metadata disabled', 'manuell zugeordnet':'Manual' }}
+  en: {{ 'manual':'Manual', 'gefunden':'found', 'nicht zugeordnet':'not matched', 'metadaten deaktiviert':'metadata disabled', 'manuell zugeordnet':'Manual' }},
+  es: {{ 'manual':'Manual', 'gefunden':'encontrado', 'nicht zugeordnet':'sin asignar', 'metadaten deaktiviert':'metadatos desactivados', 'manuell zugeordnet':'Manual' }}
 }};
 
 function t(key) {{
@@ -3663,7 +4089,7 @@ function t(key) {{
 }}
 
 function applyLanguage(language) {{
-  activeLanguage = language === 'en' ? 'en' : 'de';
+  activeLanguage = ['de','en','es'].includes(language) ? language : 'de';
   document.documentElement.lang = activeLanguage;
   document.title = t('pageTitle');
   document.querySelectorAll('[data-i18n]').forEach(element => {{
@@ -3677,16 +4103,46 @@ function applyLanguage(language) {{
   document.querySelectorAll('[data-kind-code]').forEach(element => {{
     element.textContent = element.dataset.kindCode === 'series'
       ? (activeLanguage === 'en' ? 'Series' : 'Serie')
-      : (activeLanguage === 'en' ? 'Movie' : 'Film');
+      : (activeLanguage === 'en' ? 'Movie' : (activeLanguage === 'es' ? 'Película' : 'Film'));
   }});
   document.querySelectorAll('[data-status-code]').forEach(element => {{
     const code = (element.dataset.statusCode || '').toLocaleLowerCase();
     element.textContent = (STATUS_I18N[activeLanguage] && STATUS_I18N[activeLanguage][code]) || code;
   }});
+  document.querySelectorAll('.card').forEach(card => {{
+    const localizedTitle = activeLanguage === 'de'
+      ? (card.dataset.titleDe || card.dataset.titleEn || '')
+      : (activeLanguage === 'es'
+          ? (card.dataset.titleEs || card.dataset.titleEn || card.dataset.titleDe || '')
+          : (card.dataset.titleEn || card.dataset.titleDe || card.dataset.titleEs || ''));
+    card.dataset.title = localizedTitle;
+    const titleElement = card.querySelector('.localized-title');
+    if (titleElement) titleElement.textContent = localizedTitle;
+    const trailer = card.querySelector('.trailer-link');
+    if (trailer) {{
+      const year = trailer.dataset.trailerYear || '';
+      const query = [localizedTitle, year, 'trailer'].filter(Boolean).join(' ');
+      trailer.href = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query);
+    }}
+  }});
+  document.querySelectorAll('.localized-plot').forEach(element => {{
+    element.textContent = activeLanguage === 'de'
+      ? (element.dataset.plotDe || element.dataset.plotEn || '')
+      : (activeLanguage === 'es'
+          ? (element.dataset.plotEs || element.dataset.plotEn || element.dataset.plotDe || '')
+          : (element.dataset.plotEn || element.dataset.plotDe || element.dataset.plotEs || ''));
+  }});
+  document.querySelectorAll('.genre-text[data-genre-raw]').forEach(element => {{
+    element.textContent = localizedGenreList(element.dataset.genreRaw || '');
+  }});
+  document.querySelectorAll('#genreFilter option[data-genre-name]').forEach(option => {{
+    option.textContent = localizedGenreList(option.dataset.genreName || '');
+  }});
   const languageSelect = document.getElementById('languageSelect');
   if (languageSelect) languageSelect.value = activeLanguage;
   updateServerStatusLabel();
   try {{ sessionStorage.setItem(LANGUAGE_KEY, activeLanguage); }} catch (_) {{}}
+  if (document.getElementById('grid')) filterCards();
 }}
 
 function updateServerStatusLabel() {{
@@ -3847,7 +4303,10 @@ function filterCards() {{
       const byDate = Number(b.dataset.addedTs || '0') - Number(a.dataset.addedTs || '0');
       if (byDate !== 0) return byDate;
     }}
-    return Number(a.dataset.originalOrder || '0') - Number(b.dataset.originalOrder || '0');
+    const kindOrderA = a.dataset.kind === 'series' ? 1 : 0;
+    const kindOrderB = b.dataset.kind === 'series' ? 1 : 0;
+    if (kindOrderA !== kindOrderB) return kindOrderA - kindOrderB;
+    return (a.dataset.title || '').localeCompare((b.dataset.title || ''), activeLanguage === 'de' ? 'de' : (activeLanguage === 'es' ? 'es' : 'en'), {{sensitivity:'base'}});
   }}).forEach(card => grid.appendChild(card));
   document.getElementById('empty').style.display = visible ? 'none' : 'block';
   document.getElementById('visibleCount').textContent = String(visible);
@@ -4249,7 +4708,7 @@ async function openConfigDialog() {{
     const cfg = payload.config;
     document.getElementById('cfgApiKey').value = cfg['API-Key'] || '';
     document.getElementById('cfgMaxRequests').value = String(cfg['Max-Requests'] || '');
-    document.getElementById('cfgStartupLanguage').value = cfg['Startup-Language'] === 'en' ? 'en' : 'de';
+    document.getElementById('cfgStartupLanguage').value = ['de','en','es'].includes(cfg['Startup-Language']) ? cfg['Startup-Language'] : 'de';
     document.getElementById('cfgScanStartup').value = cfg['Scan-On-Startup'] ? 'yes' : 'no';
     document.getElementById('cfgMoviesPath').value = cfg['Movies-Path'] || '';
     document.getElementById('cfgSeriesPath').value = cfg['Series-Path'] || '';
@@ -4295,7 +4754,7 @@ async function saveConfig(event) {{
       throw new Error(result.error || t('configSaveFailed'));
     }}
     if (status) {{ status.textContent = t('configSaved'); status.className = 'config-status ok'; }}
-    try {{ sessionStorage.setItem(LANGUAGE_KEY, payload['Startup-Language'] === 'en' ? 'en' : 'de'); }} catch (_) {{}}
+    try {{ sessionStorage.setItem(LANGUAGE_KEY, ['de','en','es'].includes(payload['Startup-Language']) ? payload['Startup-Language'] : 'de'); }} catch (_) {{}}
     saveViewState(null);
     window.setTimeout(() => window.location.reload(), 350);
   }} catch (error) {{
@@ -4318,7 +4777,7 @@ async function saveConfig(event) {{
 
 
 class CatalogWebHandler(BaseHTTPRequestHandler):
-    server_version = "MedienKatalog/4.12"
+    server_version = "MedienKatalog/4.15.5"
 
     def _send_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
@@ -4491,7 +4950,7 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                         continue
                     if media_id > 0:
                         ids.append(media_id)
-                language = "en" if str(data.get("language", "de")) == "en" else "de"
+                language = str(data.get("language", "de")); language = language if language in {"de", "en", "es"} else "de"
                 payload = generate_catalog_pdf(self.app.args, ids, language=language)
                 stamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H%M")
                 self._send_download(payload, "application/pdf", f"Medienkatalog_{stamp}.pdf")
@@ -4551,6 +5010,25 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                 )
                 self._send_html(
                     render_web_catalog(self.app.args, notice=f"Zuordnung auf {imdb_id} korrigiert.")
+                )
+                return
+
+            match = re.fullmatch(r"/german-title/(\d+)", path)
+            if match:
+                form = self._form()
+                german_title = set_german_title(
+                    self.app.args, int(match.group(1)), form.get("german_title", [""])[0]
+                )
+                self._send_html(
+                    render_web_catalog(self.app.args, notice=f"Deutscher Titel gespeichert: {german_title}")
+                )
+                return
+
+            match = re.fullmatch(r"/german-title-reset/(\d+)", path)
+            if match:
+                german_title = reset_german_title(self.app.args, int(match.group(1)))
+                self._send_html(
+                    render_web_catalog(self.app.args, notice=f"Deutscher Titel zurückgesetzt: {german_title}")
                 )
                 return
 
@@ -4722,9 +5200,9 @@ def parse_args(argv: Sequence[str] | None = None, *, app_config: dict[str, Any] 
         epilog=textwrap.dedent(
             """
             Beispiele:
-              python medien_katalog_web_v4_13.py --web
-              python medien_katalog_web_v4_13.py --filme-pfad "D:\\Medien\\Filme" --serien-pfad "D:\\Medien\\Serien" --csv katalog.csv
-              python medien_katalog_web_v4_13.py --ohne-metadaten --pfade
+              python medien_katalog_web_v4_15_4.py --web
+              python medien_katalog_web_v4_15_4.py --filme-pfad "D:\\Medien\\Filme" --serien-pfad "D:\\Medien\\Serien" --csv katalog.csv
+              python medien_katalog_web_v4_15_4.py --ohne-metadaten --pfade
 
             Standardquelle:
               \\\\192.168.2.208\\Multimedia

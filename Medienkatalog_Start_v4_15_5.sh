@@ -2,7 +2,7 @@
 set -u
 cd -- "$(dirname -- "$0")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-"$PYTHON_BIN" "$(pwd)/medien_katalog_web_v4_15_1.py"
+"$PYTHON_BIN" "$(pwd)/medien_katalog_web_v4_15_5.py"
 status=$?
 if [ $status -ne 0 ]; then
   echo
