@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.5"
+VERSION = "4.15.6"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
 IMDB_GRAPHQL_ENDPOINT = "https://caching.graphql.imdb.com/"
@@ -1458,6 +1458,62 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_SEASON_DIR_RE = re.compile(r"(?i)^(?:season|staffel)\s*[ ._-]*0*(\d{1,3})(?:\b|[ ._-])")
+_SEASON_SHORT_RE = re.compile(r"(?i)^s\s*0*(\d{1,3})(?:\b|[ ._-])")
+_SEASON_EPISODE_RE = re.compile(r"(?i)(?<![A-Za-z0-9])s\s*0*(\d{1,3})\s*[ ._-]*e\s*0*\d{1,4}")
+_X_EPISODE_RE = re.compile(r"(?i)(?<!\d)0*(\d{1,3})\s*[xX]\s*0*\d{1,4}")
+_STAFFEL_EPISODE_RE = re.compile(r"(?i)staffel\s*0*(\d{1,3}).{0,12}(?:folge|episode|e)\s*0*\d{1,4}")
+_SPECIAL_SEASON_NAMES = {"specials", "special", "spezial", "spezials", "spezialfolgen", "bonusfolgen"}
+
+
+def detect_server_seasons(paths: Sequence[str], series_root: str = "") -> list[int]:
+    """Detect season numbers present on disk from folder names and episode filenames.
+
+    The configured series root and the series' own top-level directory are stripped
+    where possible, so a series title containing e.g. "Season 2" is not mistaken
+    for an actual season folder.
+    """
+    root_parts = _source_root_parts(series_root) if series_root else []
+    found: set[int] = set()
+    for path in paths:
+        parts = split_path(str(path))
+        relative = parts
+        if root_parts and len(parts) > len(root_parts):
+            prefix_ok = all(a.casefold() == b.casefold() for a, b in zip(parts[:len(root_parts)], root_parts))
+            if prefix_ok:
+                relative = parts[len(root_parts):]
+        # First component below the configured series root is the series itself.
+        if len(relative) > 1:
+            relative = relative[1:]
+        for component in relative:
+            cleaned = component.strip(" ._-")
+            folded = normalized_words(cleaned)
+            if folded in _SPECIAL_SEASON_NAMES:
+                found.add(0)
+            for pattern in (_SEASON_DIR_RE, _SEASON_SHORT_RE, _SEASON_EPISODE_RE, _STAFFEL_EPISODE_RE, _X_EPISODE_RE):
+                match = pattern.search(cleaned)
+                if match:
+                    try:
+                        season = int(match.group(1))
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= season <= 999:
+                        found.add(season)
+                    break
+    return sorted(found)
+
+
+def _parse_total_seasons(value: Any) -> int | None:
+    match = re.search(r"\d+", str(value or ""))
+    if not match:
+        return None
+    try:
+        result = int(match.group(0))
+    except ValueError:
+        return None
+    return result if result > 0 else None
+
+
 def _scan_key(item: MediaItem) -> str:
     return "|".join((item.kind, normalized_words(item.title), str(item.year or "")))
 
@@ -1497,6 +1553,8 @@ def open_database(path: Path) -> sqlite3.Connection:
             actors TEXT NOT NULL DEFAULT '',
             runtime TEXT NOT NULL DEFAULT '',
             age_rating TEXT NOT NULL DEFAULT '',
+            awards TEXT NOT NULL DEFAULT '',
+            total_seasons TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT '',
             is_kids INTEGER NOT NULL DEFAULT 0,
             kids_manual INTEGER NOT NULL DEFAULT 0,
@@ -1553,6 +1611,10 @@ def open_database(path: Path) -> sqlite3.Connection:
         connection.execute("ALTER TABLE media ADD COLUMN spanish_plot TEXT NOT NULL DEFAULT ''")
     if "imdb_es_checked_at" not in columns:
         connection.execute("ALTER TABLE media ADD COLUMN imdb_es_checked_at TEXT NOT NULL DEFAULT ''")
+    if "awards" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN awards TEXT NOT NULL DEFAULT ''")
+    if "total_seasons" not in columns:
+        connection.execute("ALTER TABLE media ADD COLUMN total_seasons TEXT NOT NULL DEFAULT ''")
     # Existing databases keep the locally detected filename/folder title until
     # the first successful German IMDb localization has been cached.
     connection.execute(
@@ -1658,6 +1720,8 @@ def _metadata_values(
             "actors": "" if metadata.get("Actors") == "N/A" else str(metadata.get("Actors") or ""),
             "runtime": "" if metadata.get("Runtime") == "N/A" else str(metadata.get("Runtime") or ""),
             "age_rating": "" if metadata.get("Rated") == "N/A" else str(metadata.get("Rated") or ""),
+            "awards": "" if metadata.get("Awards") == "N/A" else str(metadata.get("Awards") or ""),
+            "total_seasons": "" if metadata.get("totalSeasons") == "N/A" else str(metadata.get("totalSeasons") or ""),
             "status": "gefunden",
         }
 
@@ -1676,6 +1740,8 @@ def _metadata_values(
             "actors": old_row["actors"],
             "runtime": old_row["runtime"],
             "age_rating": old_row["age_rating"],
+            "awards": old_row["awards"],
+            "total_seasons": old_row["total_seasons"],
             "status": old_row["status"],
         }
 
@@ -1695,6 +1761,8 @@ def _metadata_values(
         "actors": "",
         "runtime": "",
         "age_rating": "",
+        "awards": "",
+        "total_seasons": "",
         "status": "nicht zugeordnet" if lookup_attempted else "Metadaten deaktiviert",
     }
 
@@ -2114,6 +2182,8 @@ def scan_into_database(
                     not str(values.get("director") or "").strip()
                     or not str(values.get("actors") or "").strip()
                     or not str(values.get("age_rating") or "").strip()
+                    or not str(values.get("awards") or "").strip()
+                    or (item.kind == "series" and not str(values.get("total_seasons") or "").strip())
                 )
                 and str(old_row["imdb_id"] or "").strip()
             ):
@@ -2128,13 +2198,24 @@ def scan_into_database(
                     cached_rated = cached_metadata.get("Rated")
                     if not str(values.get("age_rating") or "").strip() and cached_rated and cached_rated != "N/A":
                         values["age_rating"] = str(cached_rated)
+                    cached_awards = cached_metadata.get("Awards")
+                    if not str(values.get("awards") or "").strip() and cached_awards and cached_awards != "N/A":
+                        values["awards"] = str(cached_awards)
+                    cached_total_seasons = cached_metadata.get("totalSeasons")
+                    if item.kind == "series" and not str(values.get("total_seasons") or "").strip() and cached_total_seasons and cached_total_seasons != "N/A":
+                        values["total_seasons"] = str(cached_total_seasons)
 
-                # Bei älteren Datenbanken fehlt Rated häufig auch im lokalen OMDb-Cache.
+                # Neue Felder werden bevorzugt aus dem Cache ergänzt. Falls dort
+                # noch etwas fehlt, reicht genau ein OMDb-Aufruf per bekannter IMDb-ID.
                 # Dann wird die Altersfreigabe genau einmal anhand der bereits bekannten
                 # IMDb-ID nachgeladen. Das betrifft nur Titel ohne age_rating; vollständig
                 # gepflegte Altbestände verursachen weiterhin keinerlei API-Aufrufe.
                 if (
-                    not str(values.get("age_rating") or "").strip()
+                    (
+                        not str(values.get("age_rating") or "").strip()
+                        or not str(values.get("awards") or "").strip()
+                        or (item.kind == "series" and not str(values.get("total_seasons") or "").strip())
+                    )
                     and client is not None
                     and omdb_available
                     and str(old_row["imdb_id"] or "").strip()
@@ -2142,10 +2223,16 @@ def scan_into_database(
                     try:
                         fresh_metadata = lookup_exact_imdb(client, str(old_row["imdb_id"]))
                         fresh_rated = fresh_metadata.get("Rated")
-                        if fresh_rated and fresh_rated != "N/A":
+                        if not str(values.get("age_rating") or "").strip() and fresh_rated and fresh_rated != "N/A":
                             values["age_rating"] = str(fresh_rated)
+                        fresh_awards = fresh_metadata.get("Awards")
+                        if not str(values.get("awards") or "").strip() and fresh_awards and fresh_awards != "N/A":
+                            values["awards"] = str(fresh_awards)
+                        fresh_total_seasons = fresh_metadata.get("totalSeasons")
+                        if item.kind == "series" and not str(values.get("total_seasons") or "").strip() and fresh_total_seasons and fresh_total_seasons != "N/A":
+                            values["total_seasons"] = str(fresh_total_seasons)
                     except OmdbTemporaryError as exc:
-                        print(f"Warnung beim Nachladen der Altersfreigabe für {item.title!r}: {exc}", file=sys.stderr)
+                        print(f"Warnung beim Nachladen zusätzlicher OMDb-Daten für {item.title!r}: {exc}", file=sys.stderr)
                     except OmdbFatalError as exc:
                         omdb_available = False
                         omdb_error = str(exc)
@@ -2155,7 +2242,7 @@ def scan_into_database(
                             file=sys.stderr,
                         )
                     except CatalogError as exc:
-                        print(f"Warnung beim Nachladen der Altersfreigabe für {item.title!r}: {exc}", file=sys.stderr)
+                        print(f"Warnung beim Nachladen zusätzlicher OMDb-Daten für {item.title!r}: {exc}", file=sys.stderr)
 
             kids_manual = int(old_row["kids_manual"]) if old_row else 0
             if kids_manual:
@@ -2235,9 +2322,9 @@ def scan_into_database(
                     scan_key, kind, source_title, source_year, german_title, german_title_manual,
                     german_title_imdb, german_plot, imdb_de_checked_at,
                     spanish_title_imdb, spanish_plot, imdb_es_checked_at, imdb_id, manual_imdb_id,
-                    title, year, imdb_rating, plot, poster, genre, director, actors, runtime, age_rating, status,
+                    title, year, imdb_rating, plot, poster, genre, director, actors, runtime, age_rating, awards, total_seasons, status,
                     is_kids, kids_manual, file_count, paths_json, server_added_at, last_seen_scan, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scan_key) DO UPDATE SET
                     kind=excluded.kind,
                     source_title=excluded.source_title,
@@ -2261,6 +2348,8 @@ def scan_into_database(
                     actors=excluded.actors,
                     runtime=excluded.runtime,
                     age_rating=excluded.age_rating,
+                    awards=excluded.awards,
+                    total_seasons=excluded.total_seasons,
                     status=excluded.status,
                     is_kids=excluded.is_kids,
                     kids_manual=excluded.kids_manual,
@@ -2295,6 +2384,8 @@ def scan_into_database(
                     values["actors"],
                     values["runtime"],
                     values["age_rating"],
+                    values["awards"],
+                    values["total_seasons"],
                     values["status"],
                     is_kids,
                     kids_manual,
@@ -2407,7 +2498,7 @@ def correct_database_item(
                 manual_imdb_id=?, imdb_id=?, title=?, year=?, imdb_rating=?, plot=?,
                 german_title=?, german_title_imdb=?, german_plot=?, imdb_de_checked_at=?,
                 spanish_title_imdb=?, spanish_plot=?, imdb_es_checked_at=?,
-                poster=?, genre=?, director=?, actors=?, runtime=?, age_rating=?, status='manuell zugeordnet',
+                poster=?, genre=?, director=?, actors=?, runtime=?, age_rating=?, awards=?, total_seasons=?, status='manuell zugeordnet',
                 is_kids=CASE WHEN kids_manual=1 THEN is_kids ELSE ? END, updated_at=?
             WHERE id=?
             """,
@@ -2431,6 +2522,8 @@ def correct_database_item(
                 "" if metadata.get("Actors") == "N/A" else str(metadata.get("Actors") or ""),
                 "" if metadata.get("Runtime") == "N/A" else str(metadata.get("Runtime") or ""),
                 "" if metadata.get("Rated") == "N/A" else str(metadata.get("Rated") or ""),
+                "" if metadata.get("Awards") == "N/A" else str(metadata.get("Awards") or ""),
+                "" if metadata.get("totalSeasons") == "N/A" else str(metadata.get("totalSeasons") or ""),
                 auto_kids,
                 _utc_now(),
                 media_id,
@@ -3058,6 +3151,9 @@ def generate_catalog_pdf(
             "director": "Regie",
             "cast": "Besetzung",
             "age_rating": "FSK/Rating",
+            "awards": "Auszeichnungen",
+            "seasons": "Staffeln",
+            "server_seasons": "Auf Server",
             "plot": "Beschreibung",
             "no_cover": "Kein Cover",
             "unrated": "ohne Bewertung",
@@ -3077,6 +3173,9 @@ def generate_catalog_pdf(
             "director": "Director",
             "cast": "Cast",
             "age_rating": "Age rating",
+            "awards": "Awards",
+            "seasons": "Seasons",
+            "server_seasons": "On server",
             "plot": "Plot",
             "no_cover": "No cover",
             "unrated": "not rated",
@@ -3096,6 +3195,9 @@ def generate_catalog_pdf(
             "director": "Dirección",
             "cast": "Reparto",
             "age_rating": "Clasificación por edad",
+            "awards": "Premios",
+            "seasons": "Temporadas",
+            "server_seasons": "En el servidor",
             "plot": "Sinopsis",
             "no_cover": "Sin carátula",
             "unrated": "sin valoración",
@@ -3299,6 +3401,24 @@ def generate_catalog_pdf(
         actors = str(row["actors"] or "").strip()
         if actors:
             right_story.append(Paragraph(f'<b>{esc(text["cast"])}:</b> {esc(shortened(actors, 260))}', info_style))
+        awards = str(row["awards"] or "").strip()
+        if awards:
+            right_story.append(Paragraph(f'<b>{esc(text["awards"])}:</b> {esc(shortened(awards, 240))}', info_style))
+        if str(row["kind"]) == "series":
+            total_seasons = _parse_total_seasons(row["total_seasons"])
+            try:
+                row_paths = json.loads(row["paths_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                row_paths = []
+            server_seasons = detect_server_seasons(row_paths, str(getattr(args, "series_path", "") or ""))
+            season_bits: list[str] = []
+            if total_seasons:
+                season_bits.append(f'<b>{esc(text["seasons"])}:</b> {total_seasons}')
+            if server_seasons:
+                shown = ", ".join("S0" if n == 0 else f"S{n}" for n in server_seasons)
+                season_bits.append(f'<b>{esc(text["server_seasons"])}:</b> {esc(shown)}')
+            if season_bits:
+                right_story.append(Paragraph(" &nbsp;·&nbsp; ".join(season_bits), info_style))
         plot = str((row["german_plot"] if lang == "de" else (row["spanish_plot"] if lang == "es" else row["plot"])) or row["plot"] or "").strip()
         if plot:
             right_story.append(Paragraph(f'<b>{esc(text["plot"])}:</b> {esc(shortened(plot, 620))}', plot_style))
@@ -3545,6 +3665,8 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         genre_raw = str(row["genre"] or "")
         director_raw = str(row["director"] or "")
         actors_raw = str(row["actors"] or "")
+        awards_raw = str(row["awards"] or "").strip()
+        total_seasons = _parse_total_seasons(row["total_seasons"]) if str(row["kind"]) == "series" else None
         genre = html.escape(genre_raw)
         director = html.escape(director_raw)
         actors = html.escape(actors_raw)
@@ -3606,6 +3728,29 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         except (json.JSONDecodeError, TypeError):
             paths = []
         paths_html = "".join(f"<li>{html.escape(str(path))}</li>" for path in paths)
+        server_seasons = detect_server_seasons(paths, str(getattr(args, "series_path", "") or "")) if str(row["kind"]) == "series" else []
+        seasons_html = ""
+        if str(row["kind"]) == "series" and (total_seasons or server_seasons):
+            badge_seasons: list[int] = []
+            if total_seasons:
+                badge_seasons.extend(range(1, total_seasons + 1))
+            for season_no in server_seasons:
+                if season_no not in badge_seasons:
+                    badge_seasons.append(season_no)
+            badge_seasons = sorted(set(badge_seasons), key=lambda value: (value != 0, value))
+            badges: list[str] = []
+            for season_no in badge_seasons:
+                available = season_no in server_seasons
+                label = "S0" if season_no == 0 else f"S{season_no}"
+                state = "available" if available else "missing"
+                mark = "✓" if available else "—"
+                badges.append(f'<span class="season-badge {state}">{label} {mark}</span>')
+            count_html = f'<span class="season-count">{total_seasons}</span>' if total_seasons else ""
+            separator = " · " if count_html and badges else ""
+            seasons_html = (
+                '<div class="facts seasons"><span data-i18n="seasonsLabel">Staffeln</span>: ' + count_html + separator +
+                '<span class="season-badges">' + "".join(badges) + '</span></div>'
+            )
         server_added_raw = str(row["server_added_at"] or "")
         server_added_ts = 0
         server_added_display = ""
@@ -3628,7 +3773,7 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
               data-title-de="{html.escape(german_title_raw, quote=True)}"
               data-title-es="{html.escape(spanish_title_raw, quote=True)}"
               data-year="{html.escape(str(row['year'] or ''), quote=True)}"
-              data-search="{html.escape((title_raw+' '+german_title_raw+' '+spanish_title_raw+' '+str(row['source_title'])+' '+str(row['year'])+' '+genre_raw+' '+director_raw+' '+actors_raw+' '+str(row['age_rating'] or '')).casefold(), quote=True)}"
+              data-search="{html.escape((title_raw+' '+german_title_raw+' '+spanish_title_raw+' '+str(row['source_title'])+' '+str(row['year'])+' '+genre_raw+' '+director_raw+' '+actors_raw+' '+awards_raw+' '+str(row['age_rating'] or '')).casefold(), quote=True)}"
               data-genres="{html.escape(json.dumps(genre_values, ensure_ascii=False), quote=True)}"
               data-directors="{html.escape(json.dumps(director_values, ensure_ascii=False), quote=True)}"
               data-actors="{html.escape(json.dumps(actor_values, ensure_ascii=False), quote=True)}"
@@ -3647,6 +3792,8 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
                 {f'<div class="facts added-date"><span data-i18n="addedLabel">Auf Server</span>: {html.escape(server_added_display)}</div>' if server_added_display else ''}
                 {f'<div class="facts director"><span data-i18n="directorLabel">Regie</span>: {director}</div>' if director else ''}
                 {f'<div class="facts actors"><span data-i18n="castLabel">Besetzung</span>: {actors}</div>' if actors else ''}
+                {f'<div class="facts awards"><span data-i18n="awardsLabel">Auszeichnungen</span>: {html.escape(awards_raw)}</div>' if awards_raw else ''}
+                {seasons_html}
                 <p class="localized-plot" data-plot-en="{html.escape(plot_en_raw, quote=True)}" data-plot-de="{html.escape(plot_de_raw, quote=True)}" data-plot-es="{html.escape(plot_es_raw, quote=True)}">{plot}</p>
                 <div class="links">{imdb_html}{trailer_html}<button class="play-button" type="button" onclick="startMedia({int(row['id'])}, this, '{'series' if str(row['kind']) == 'series' else 'movie'}')" data-i18n="{'openFolder' if str(row['kind']) == 'series' else 'playFilm'}">{'Ordner öffnen' if str(row['kind']) == 'series' else 'Film starten'}</button><span>{int(row['file_count'])} <span data-i18n="files">Datei(en)</span></span></div>
                 <details>
@@ -3759,6 +3906,12 @@ main {{ padding:24px max(18px,4vw) 50px; }}
 .kind,.status,.kids-badge {{ border:1px solid #3a424f; border-radius:999px; padding:2px 7px; }} .badges {{ display:flex; gap:5px; align-items:center; }} .kids-badge {{ border-color:#7c6231; color:#ffd978; }} h2 {{ margin:8px 0 2px; font-size:1.15rem; }} h2 small {{ color:var(--muted); font-weight:500; }}
 .rating {{ color:var(--accent); font-size:1.1rem; font-weight:800; }} .rating span {{ color:var(--muted); font-size:.8rem; }} .facts,.links,.detected {{ color:var(--muted); font-size:.84rem; }} .links {{ align-items:center; flex-wrap:wrap; }}
 .age-rating {{ display:flex; align-items:center; gap:4px; flex-wrap:wrap; margin-top:2px; }}
+.seasons {{ display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-top:4px; }}
+.season-badges {{ display:inline-flex; flex-wrap:wrap; gap:4px; }}
+.season-badge {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; padding:2px 6px; border-radius:999px; border:1px solid rgba(160,170,185,.28); font-size:.74rem; line-height:1.25; }}
+.season-badge.available {{ background:rgba(76,175,80,.16); border-color:rgba(95,190,100,.42); color:#a7e7aa; }}
+.season-badge.missing {{ background:rgba(140,150,165,.08); color:var(--muted); opacity:.72; }}
+.awards {{ margin-top:3px; }}
 .age-label {{ color:var(--muted); }}
 .age-badge {{ display:inline-flex; align-items:center; padding:1px 6px; border-radius:6px; font-size:.72rem; line-height:1.35; font-weight:700; letter-spacing:.01em; border:1px solid #4a5260; background:#232933; color:#d7dde7; }}
 .age-all {{ color:#86d79c; background:rgba(66,135,83,.12); border-color:rgba(104,188,124,.35); }}
@@ -3988,7 +4141,7 @@ const I18N = {{
     noMatches:'Keine passenden Titel.', noCover:'Kein Cover', openIMDb:'IMDb öffnen', searchTrailer:'Trailer suchen',
     searchIMDb:'Auf IMDb suchen', imdbSearchHint:'Bis zu 10 IMDb-Treffer anzeigen und direkt zuweisen.',
     imdbSearching:'IMDb wird durchsucht …', imdbNoResults:'Keine IMDb-Treffer gefunden.', imdbSearchFailed:'IMDb-Suche fehlgeschlagen.', assignIMDb:'Zuweisen',
-    kidsBadge:'Kinder', ageRatingLabel:'FSK/Rating', directorLabel:'Regie', castLabel:'Besetzung', playFilm:'Film starten', openFolder:'Ordner öffnen',
+    kidsBadge:'Kinder', ageRatingLabel:'FSK/Rating', directorLabel:'Regie', castLabel:'Besetzung', awardsLabel:'Auszeichnungen', seasonsLabel:'Staffeln', playFilm:'Film starten', openFolder:'Ordner öffnen',
     files:'Datei(en)', sourceCorrection:'Quelle & Korrektur', detectedAs:'Erkannt als',
     correctionPlaceholder:'IMDb-/OMDb-URL oder tt1234567', correctMapping:'Zuordnung korrigieren',
     removeKids:'Kinder-Markierung entfernen', markKids:'Als Kinderinhalt markieren',
@@ -4014,7 +4167,7 @@ const I18N = {{
     noMatches:'No matching titles.', noCover:'No cover', openIMDb:'Open IMDb', searchTrailer:'Search trailer',
     searchIMDb:'Search IMDb', imdbSearchHint:'Show up to 10 IMDb results and assign one directly.',
     imdbSearching:'Searching IMDb …', imdbNoResults:'No IMDb results found.', imdbSearchFailed:'IMDb search failed.', assignIMDb:'Assign',
-    kidsBadge:'Kids', ageRatingLabel:'Age rating', directorLabel:'Director', castLabel:'Cast', playFilm:'Play', openFolder:'Open folder',
+    kidsBadge:'Kids', ageRatingLabel:'Age rating', directorLabel:'Director', castLabel:'Cast', awardsLabel:'Awards', seasonsLabel:'Seasons', playFilm:'Play', openFolder:'Open folder',
     files:'file(s)', sourceCorrection:'Source & correction', detectedAs:'Detected as',
     correctionPlaceholder:'IMDb/OMDb URL or tt1234567', correctMapping:'Correct match',
     removeKids:'Remove kids tag', markKids:'Mark as kids content',
@@ -4040,7 +4193,7 @@ const I18N = {{
     noMatches:'No hay títulos coincidentes.', noCover:'Sin carátula', openIMDb:'Abrir IMDb', searchTrailer:'Buscar tráiler',
     searchIMDb:'Buscar en IMDb', imdbSearchHint:'Mostrar hasta 10 resultados de IMDb y asignar uno directamente.',
     imdbSearching:'Buscando en IMDb …', imdbNoResults:'No se encontraron resultados en IMDb.', imdbSearchFailed:'Falló la búsqueda en IMDb.', assignIMDb:'Asignar',
-    kidsBadge:'Infantil', ageRatingLabel:'Clasificación por edad', directorLabel:'Dirección', castLabel:'Reparto', playFilm:'Reproducir película', openFolder:'Abrir carpeta',
+    kidsBadge:'Infantil', ageRatingLabel:'Clasificación por edad', directorLabel:'Dirección', castLabel:'Reparto', awardsLabel:'Premios', seasonsLabel:'Temporadas', playFilm:'Reproducir película', openFolder:'Abrir carpeta',
     files:'archivo(s)', sourceCorrection:'Fuente y corrección', detectedAs:'Detectado como',
     correctionPlaceholder:'URL de IMDb/OMDb o tt1234567', correctMapping:'Corregir asignación',
     removeKids:'Quitar etiqueta infantil', markKids:'Marcar como contenido infantil',
@@ -4777,7 +4930,7 @@ async function saveConfig(event) {{
 
 
 class CatalogWebHandler(BaseHTTPRequestHandler):
-    server_version = "MedienKatalog/4.15.5"
+    server_version = "MedienKatalog/4.15.6"
 
     def _send_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
@@ -5200,9 +5353,9 @@ def parse_args(argv: Sequence[str] | None = None, *, app_config: dict[str, Any] 
         epilog=textwrap.dedent(
             """
             Beispiele:
-              python medien_katalog_web_v4_15_4.py --web
-              python medien_katalog_web_v4_15_4.py --filme-pfad "D:\\Medien\\Filme" --serien-pfad "D:\\Medien\\Serien" --csv katalog.csv
-              python medien_katalog_web_v4_15_4.py --ohne-metadaten --pfade
+              python medien_katalog_web_v4_15_6.py --web
+              python medien_katalog_web_v4_15_6.py --filme-pfad "D:\\Medien\\Filme" --serien-pfad "D:\\Medien\\Serien" --csv katalog.csv
+              python medien_katalog_web_v4_15_6.py --ohne-metadaten --pfade
 
             Standardquelle:
               \\\\192.168.2.208\\Multimedia
