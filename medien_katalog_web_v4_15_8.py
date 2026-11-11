@@ -54,15 +54,24 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.6"
+VERSION = "4.15.8"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
 IMDB_GRAPHQL_ENDPOINT = "https://caching.graphql.imdb.com/"
 DEFAULT_OMDB_API_KEY = "fae48dc5"
 OMDB_DAILY_LIMIT = 100000  # Wird beim Start aus config.txt überschrieben.
-DEFAULT_MEDIA_SOURCE = r"\\192.168.2.208\Multimedia"
-DEFAULT_MOVIES_SOURCE = DEFAULT_MEDIA_SOURCE + r"\Filme"
-DEFAULT_SERIES_SOURCE = DEFAULT_MEDIA_SOURCE + r"\Serien"
+# Platform-specific defaults. The current media server is reachable as a UNC share
+# under Windows and as an SMB URI under desktop Linux. Existing config.txt files
+# with only Movies-Path/Series-Path remain fully supported.
+DEFAULT_WINDOWS_MEDIA_SOURCE = r"\\169.254.100.100\Multimedia"
+DEFAULT_LINUX_MEDIA_SOURCE = "smb://169.254.100.100/Multimedia"
+DEFAULT_WINDOWS_MOVIES_SOURCE = DEFAULT_WINDOWS_MEDIA_SOURCE + r"\Filme"
+DEFAULT_WINDOWS_SERIES_SOURCE = DEFAULT_WINDOWS_MEDIA_SOURCE + r"\Serien"
+DEFAULT_LINUX_MOVIES_SOURCE = DEFAULT_LINUX_MEDIA_SOURCE + "/Filme"
+DEFAULT_LINUX_SERIES_SOURCE = DEFAULT_LINUX_MEDIA_SOURCE + "/Serien"
+DEFAULT_MEDIA_SOURCE = DEFAULT_WINDOWS_MEDIA_SOURCE if os.name == "nt" else DEFAULT_LINUX_MEDIA_SOURCE
+DEFAULT_MOVIES_SOURCE = DEFAULT_WINDOWS_MOVIES_SOURCE if os.name == "nt" else DEFAULT_LINUX_MOVIES_SOURCE
+DEFAULT_SERIES_SOURCE = DEFAULT_WINDOWS_SERIES_SOURCE if os.name == "nt" else DEFAULT_LINUX_SERIES_SOURCE
 CONFIG_FILENAME = "config.txt"
 DEFAULT_STARTUP_LANGUAGE = "de"
 DEFAULT_SCAN_ON_STARTUP = True
@@ -71,6 +80,60 @@ DEFAULT_SCAN_ON_STARTUP = True
 def config_path() -> Path:
     """Konfiguration immer neben dem Python-Skript suchen."""
     return Path(__file__).resolve().parent / CONFIG_FILENAME
+
+
+def _unc_to_smb_uri(target: str) -> str:
+    r"""Convert a Windows UNC path into an SMB URI understood by Linux desktops."""
+    value = str(target or "").strip()
+    if not value.startswith("\\\\"):
+        return value
+    parts = [part for part in value.lstrip("\\").split("\\") if part]
+    if len(parts) < 2:
+        return value
+    host = quote(parts[0], safe="[]:.-_~")
+    path = "/".join(quote(part, safe="!$&'()*+,;=:@-._~") for part in parts[1:])
+    return f"smb://{host}/{path}"
+
+
+def _smb_uri_to_unc(target: str) -> str:
+    """Convert smb://server/share/path into a Windows UNC path."""
+    value = str(target or "").strip()
+    if not value.casefold().startswith("smb://"):
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.hostname:
+        return value
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if not parts:
+        return value
+    return "\\\\" + parsed.hostname + "\\" + "\\".join(parts)
+
+
+def _platform_media_path(value: str, *, platform: str | None = None) -> str:
+    """Return a media path in the native form for Windows or desktop Linux.
+
+    Windows prefers UNC paths, Linux/macOS prefers smb:// for network shares.
+    Normal local POSIX paths are left untouched on non-Windows systems.
+    """
+    raw = str(value or "").strip()
+    platform = platform or ("windows" if os.name == "nt" else "linux")
+    if platform == "windows":
+        return _smb_uri_to_unc(raw)
+    return _unc_to_smb_uri(raw)
+
+
+def _active_platform_paths(config: dict[str, Any]) -> tuple[str, str]:
+    """Select the configured Windows or Linux roots for the current OS."""
+    if os.name == "nt":
+        movies = str(config.get("Windows-Movies-Path") or config.get("Movies-Path") or DEFAULT_WINDOWS_MOVIES_SOURCE)
+        series = str(config.get("Windows-Series-Path") or config.get("Series-Path") or DEFAULT_WINDOWS_SERIES_SOURCE)
+        return _platform_media_path(movies, platform="windows"), _platform_media_path(series, platform="windows")
+    movies = str(config.get("Linux-Movies-Path") or config.get("Movies-Path") or DEFAULT_LINUX_MOVIES_SOURCE)
+    series = str(config.get("Linux-Series-Path") or config.get("Series-Path") or DEFAULT_LINUX_SERIES_SOURCE)
+    return _platform_media_path(movies, platform="linux"), _platform_media_path(series, platform="linux")
 
 
 def _join_media_child(base: str, child: str) -> str:
@@ -85,13 +148,14 @@ def _join_media_child(base: str, child: str) -> str:
 
 
 def _normalize_app_config(values: dict[str, Any], *, seen_keys: set[str] | None = None) -> dict[str, Any]:
-    """Validate and normalize application settings.
+    """Validate settings and derive platform-specific media roots.
 
-    ``Media-Path`` is accepted as a legacy setting. If the new explicit movie
-    and series paths are absent, they are derived from it automatically.
+    Older config files containing only Movies-Path/Series-Path are migrated in
+    memory automatically: UNC becomes smb:// on Linux, smb:// becomes UNC on
+    Windows. New config files may store explicit paths for both operating systems.
     """
     seen_keys = seen_keys or set(values)
-    legacy_media = str(values.get("Media-Path") or DEFAULT_MEDIA_SOURCE).strip() or DEFAULT_MEDIA_SOURCE
+    legacy_media = str(values.get("Media-Path") or DEFAULT_WINDOWS_MEDIA_SOURCE).strip() or DEFAULT_WINDOWS_MEDIA_SOURCE
 
     try:
         limit = int(str(values.get("Max-Requests", OMDB_DAILY_LIMIT)).replace(".", "").replace(" ", ""))
@@ -101,7 +165,7 @@ def _normalize_app_config(values: dict[str, Any], *, seen_keys: set[str] | None 
         raise CatalogError("Max-Requests muss eine positive ganze Zahl sein.")
 
     language = str(values.get("Startup-Language", DEFAULT_STARTUP_LANGUAGE)).strip().casefold()
-    aliases = {"de": "de", "deutsch": "de", "german": "de", "en": "en", "english": "en", "englisch": "en", "es": "es", "espanol": "es", "español": "es", "spanish": "es", "spanisch": "es"}
+    aliases = {"de":"de","deutsch":"de","german":"de","en":"en","english":"en","englisch":"en","es":"es","espanol":"es","español":"es","spanish":"es","spanisch":"es"}
     if language not in aliases:
         raise CatalogError("Startup-Language muss de, en oder es sein.")
 
@@ -110,38 +174,58 @@ def _normalize_app_config(values: dict[str, Any], *, seen_keys: set[str] | None 
         scan = raw_scan
     else:
         scan_text = str(raw_scan).strip().casefold()
-        if scan_text in {"yes", "y", "ja", "j", "true", "1", "on"}:
+        if scan_text in {"yes","y","ja","j","true","1","on"}:
             scan = True
-        elif scan_text in {"no", "n", "nein", "false", "0", "off"}:
+        elif scan_text in {"no","n","nein","false","0","off"}:
             scan = False
         else:
             raise CatalogError("Scan-On-Startup muss Yes oder No sein.")
 
-    movies_value = str(values.get("Movies-Path") or "").strip()
-    series_value = str(values.get("Series-Path") or "").strip()
-    if "Movies-Path" not in seen_keys or not movies_value:
-        movies_value = _join_media_child(legacy_media, "Filme")
-    if "Series-Path" not in seen_keys or not series_value:
-        series_value = _join_media_child(legacy_media, "Serien")
-    if not movies_value or not series_value:
-        raise CatalogError("Movies-Path und Series-Path dürfen nicht leer sein.")
+    generic_movies = str(values.get("Movies-Path") or "").strip()
+    generic_series = str(values.get("Series-Path") or "").strip()
+    if not generic_movies:
+        generic_movies = _join_media_child(legacy_media, "Filme")
+    if not generic_series:
+        generic_series = _join_media_child(legacy_media, "Serien")
 
-    return {
+    windows_movies = str(values.get("Windows-Movies-Path") or "").strip()
+    windows_series = str(values.get("Windows-Series-Path") or "").strip()
+    linux_movies = str(values.get("Linux-Movies-Path") or "").strip()
+    linux_series = str(values.get("Linux-Series-Path") or "").strip()
+
+    if not windows_movies:
+        windows_movies = _platform_media_path(generic_movies, platform="windows")
+    if not windows_series:
+        windows_series = _platform_media_path(generic_series, platform="windows")
+    if not linux_movies:
+        linux_movies = _platform_media_path(generic_movies, platform="linux")
+    if not linux_series:
+        linux_series = _platform_media_path(generic_series, platform="linux")
+
+    if not windows_movies or not windows_series or not linux_movies or not linux_series:
+        raise CatalogError("Die Medienpfade dürfen nicht leer sein.")
+
+    normalized = {
         "API-Key": str(values.get("API-Key") or "").strip(),
         "Max-Requests": limit,
         "Startup-Language": aliases[language],
         "Scan-On-Startup": scan,
-        "Movies-Path": movies_value,
-        "Series-Path": series_value,
-        "Media-Path": legacy_media,  # nur intern/abwärtskompatibel
+        "Windows-Movies-Path": windows_movies,
+        "Windows-Series-Path": windows_series,
+        "Linux-Movies-Path": linux_movies,
+        "Linux-Series-Path": linux_series,
+        "Media-Path": legacy_media,
     }
-
+    active_movies, active_series = _active_platform_paths(normalized)
+    normalized["Movies-Path"] = active_movies
+    normalized["Series-Path"] = active_series
+    return normalized
 
 def load_app_config() -> dict[str, Any]:
     """Einfache Key=Value-Konfiguration aus config.txt laden.
 
     Die aktuellen Schlüssel sind API-Key, Max-Requests, Startup-Language,
-    Scan-On-Startup, Movies-Path und Series-Path. ``Media-Path`` wird weiterhin
+    Scan-On-Startup sowie getrennte Windows-/Linux-Medienpfade. ``Media-Path`` wird weiterhin
     gelesen, damit ältere config.txt-Dateien automatisch funktionieren.
     """
     raw: dict[str, Any] = {
@@ -149,9 +233,14 @@ def load_app_config() -> dict[str, Any]:
         "Max-Requests": OMDB_DAILY_LIMIT,
         "Startup-Language": DEFAULT_STARTUP_LANGUAGE,
         "Scan-On-Startup": "Yes" if DEFAULT_SCAN_ON_STARTUP else "No",
-        "Media-Path": DEFAULT_MEDIA_SOURCE,
+        "Media-Path": DEFAULT_WINDOWS_MEDIA_SOURCE,
     }
-    known = {"API-Key", "Max-Requests", "Startup-Language", "Scan-On-Startup", "Movies-Path", "Series-Path", "Media-Path"}
+    known = {
+        "API-Key", "Max-Requests", "Startup-Language", "Scan-On-Startup",
+        "Movies-Path", "Series-Path", "Media-Path",
+        "Windows-Movies-Path", "Windows-Series-Path",
+        "Linux-Movies-Path", "Linux-Series-Path",
+    }
     seen: set[str] = set()
     path = config_path()
     if path.exists():
@@ -181,9 +270,11 @@ def load_app_config() -> dict[str, Any]:
             "Max-Requests": OMDB_DAILY_LIMIT,
             "Startup-Language": DEFAULT_STARTUP_LANGUAGE,
             "Scan-On-Startup": DEFAULT_SCAN_ON_STARTUP,
-            "Media-Path": DEFAULT_MEDIA_SOURCE,
-            "Movies-Path": DEFAULT_MOVIES_SOURCE,
-            "Series-Path": DEFAULT_SERIES_SOURCE,
+            "Media-Path": DEFAULT_WINDOWS_MEDIA_SOURCE,
+            "Windows-Movies-Path": DEFAULT_WINDOWS_MOVIES_SOURCE,
+            "Windows-Series-Path": DEFAULT_WINDOWS_SERIES_SOURCE,
+            "Linux-Movies-Path": DEFAULT_LINUX_MOVIES_SOURCE,
+            "Linux-Series-Path": DEFAULT_LINUX_SERIES_SOURCE,
         }
         return _normalize_app_config(fallback, seen_keys=set(fallback))
 
@@ -193,25 +284,24 @@ def save_app_config(values: dict[str, Any]) -> dict[str, Any]:
     normalized = _normalize_app_config(values, seen_keys=set(values))
     lines = [
         "# Media Catalog Configuration",
-        "# These values can also be changed from Settings in the web interface.",
+        "# The operating system is detected automatically.",
+        "# Windows uses the Windows-* paths; Linux uses the Linux-* paths.",
+        "# Linux SMB paths do NOT need a /mnt mount and work directly via smb://.",
         "#",
         "# Startup-Language: de = German, en = English, es = Spanish",
         "# Scan-On-Startup: Yes = scan media folders at startup, No = open the existing database immediately",
         "#",
-        "# Path examples:",
-        r"# Windows UNC:     Movies-Path=\\192.168.2.208\Multimedia\Filme",
-        r"# Windows UNC:     Series-Path=\\192.168.2.208\Multimedia\Serien",
-        r"# Windows drive:   Movies-Path=Z:\Multimedia\Filme",
-        r"# Windows drive:   Series-Path=Z:\Multimedia\Serien",
-        "# Linux mount:     Movies-Path=/mnt/multimedia/Filme",
-        "# Linux mount:     Series-Path=/mnt/multimedia/Serien",
+        r"# Windows example: \\169.254.100.100\Multimedia\Filme",
+        "# Linux example:  smb://169.254.100.100/Multimedia/Filme",
         "",
         f"API-Key={normalized['API-Key']}",
         f"Max-Requests={normalized['Max-Requests']}",
         f"Startup-Language={normalized['Startup-Language']}",
         f"Scan-On-Startup={'Yes' if normalized['Scan-On-Startup'] else 'No'}",
-        f"Movies-Path={normalized['Movies-Path']}",
-        f"Series-Path={normalized['Series-Path']}",
+        f"Windows-Movies-Path={normalized['Windows-Movies-Path']}",
+        f"Windows-Series-Path={normalized['Windows-Series-Path']}",
+        f"Linux-Movies-Path={normalized['Linux-Movies-Path']}",
+        f"Linux-Series-Path={normalized['Linux-Series-Path']}",
         "",
     ]
     path = config_path()
@@ -3511,16 +3601,81 @@ def _configured_title_folder(row: sqlite3.Row, configured_root: str) -> str:
     return str(parent)
 
 
+def _rebase_stored_media_target(target: str, configured_root: str) -> str:
+    """Setzt einen gespeicherten Medienpfad auf den aktuell konfigurierten Root um.
+
+    Das ist vor allem bei gemeinsam genutzten SQLite-Datenbanken wichtig: Ein unter
+    Windows gespeicherter UNC-Pfad kann unter Linux auf einen lokalen Mount oder auf
+    eine andere SMB-Adresse zeigen. Ebenso werden alte Server-IP-Adressen ersetzt,
+    solange der relative Pfad unterhalb von ``Filme``/``Serien`` gleich geblieben ist.
+    """
+    stored = str(target or "").strip()
+    root = str(configured_root or "").strip().rstrip("\\/")
+    if not stored or not root:
+        return stored
+
+    stored_parts = split_path(stored)
+    if not stored_parts:
+        return stored
+
+    if root.casefold().startswith("smb://"):
+        try:
+            parsed = urlsplit(root)
+            root_parts = [unquote(part) for part in parsed.path.split("/") if part]
+        except ValueError:
+            return stored
+        if not root_parts:
+            return stored
+        marker = normalized_words(root_parts[-1])
+        index = next((i for i, part in enumerate(stored_parts) if normalized_words(part) == marker), -1)
+        if index < 0:
+            return stored
+        tail = stored_parts[index + 1 :]
+        if not tail:
+            return root
+        encoded_tail = "/".join(quote(part, safe="!$&'()*+,;=:@-._~") for part in tail)
+        return root + "/" + encoded_tail
+
+    root_parts = split_path(root)
+    if not root_parts:
+        return stored
+    marker = normalized_words(root_parts[-1])
+    index = next((i for i, part in enumerate(stored_parts) if normalized_words(part) == marker), -1)
+    if index < 0:
+        return stored
+    tail = stored_parts[index + 1 :]
+
+    if root.startswith("\\") or re.match(r"^[A-Za-z]:[\\/]", root):
+        return str(PureWindowsPath(root, *tail))
+    return str(Path(root).joinpath(*tail))
+
+
+
 def _open_with_desktop_default(target: str) -> None:
-    """Öffnet Datei/Ordner mit der Desktop-Standardanwendung des Betriebssystems."""
+    """Öffnet Datei/Ordner mit der Desktop-Standardanwendung des Betriebssystems.
+
+    Windows öffnet UNC-Pfade direkt. Unter Linux werden Windows-UNC-Pfade in
+    ``smb://``-URIs umgewandelt, damit KDE/KIO, GNOME/GVfs usw. sie nicht als
+    relative lokale Dateipfade interpretieren.
+    """
+    value = str(target or "").strip()
+    if not value:
+        raise FileNotFoundError("Leerer Medienpfad")
+
     if os.name == "nt":
-        os.startfile(target)  # type: ignore[attr-defined]
+        os.startfile(value)  # type: ignore[attr-defined]
         return
     if sys.platform == "darwin":
-        subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["open", value], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
-    # Freedesktop-Standard unter Desktop-Linux (GNOME, KDE, XFCE, Cinnamon ...).
-    subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    linux_target = _unc_to_smb_uri(value)
+    try:
+        subprocess.Popen(["xdg-open", linux_target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        # ``gio open`` ist auf vielen GNOME-/GTK-Desktops verfügbar und versteht
+        # ebenfalls smb://. Damit bleibt die Funktion auch ohne xdg-utils nutzbar.
+        subprocess.Popen(["gio", "open", linux_target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def start_media(args: argparse.Namespace, media_id: int) -> str:
@@ -3541,9 +3696,11 @@ def start_media(args: argparse.Namespace, media_id: int) -> str:
     kind = str(row["kind"] or "")
     if kind == "series":
         target = _configured_title_folder(row, args.series_path)
+        target = _rebase_stored_media_target(target, args.series_path)
         action_error = "Der Serienordner konnte nicht geöffnet werden"
     else:
         target = _media_file_from_row(row)
+        target = _rebase_stored_media_target(target, args.movies_path)
         action_error = "Der Film konnte nicht mit dem Standardplayer gestartet werden"
 
     try:
@@ -4105,11 +4262,17 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
         <label for="cfgScanStartup" data-i18n="cfgScanStartup">Scan beim Start</label>
         <select id="cfgScanStartup"><option value="yes" data-i18n="yes">Ja</option><option value="no" data-i18n="no">Nein</option></select>
 
-        <label for="cfgMoviesPath" data-i18n="cfgMoviesPath">Pfad Filme</label>
-        <input id="cfgMoviesPath" type="text" spellcheck="false">
+        <label for="cfgWindowsMoviesPath" data-i18n="cfgWindowsMoviesPath">Windows: Pfad Filme</label>
+        <input id="cfgWindowsMoviesPath" type="text" spellcheck="false">
 
-        <label for="cfgSeriesPath" data-i18n="cfgSeriesPath">Pfad Serien</label>
-        <input id="cfgSeriesPath" type="text" spellcheck="false">
+        <label for="cfgWindowsSeriesPath" data-i18n="cfgWindowsSeriesPath">Windows: Pfad Serien</label>
+        <input id="cfgWindowsSeriesPath" type="text" spellcheck="false">
+
+        <label for="cfgLinuxMoviesPath" data-i18n="cfgLinuxMoviesPath">Linux: Pfad Filme</label>
+        <input id="cfgLinuxMoviesPath" type="text" spellcheck="false">
+
+        <label for="cfgLinuxSeriesPath" data-i18n="cfgLinuxSeriesPath">Linux: Pfad Serien</label>
+        <input id="cfgLinuxSeriesPath" type="text" spellcheck="false">
       </div>
       <p class="config-note" data-i18n="configNote">Änderungen werden in config.txt neben dem Python-Skript gespeichert. Neue Pfade gelten beim nächsten Bibliotheks-Scan.</p>
       <div class="config-actions">
@@ -4135,7 +4298,7 @@ const I18N = {{
     allGenres:'Alle Genres', allDirectors:'Alle Regisseure', allActors:'Alle Schauspieler',
     allAddedDates:'Alle Speicherzeiten', last7Days:'Zuletzt hinzugefügt: 7 Tage', last30Days:'Zuletzt hinzugefügt: 30 Tage',
     last90Days:'Zuletzt hinzugefügt: 90 Tage', last365Days:'Zuletzt hinzugefügt: 1 Jahr', addedLabel:'Auf Server',
-    resetFilters:'Zurücksetzen', refreshLibrary:'Bibliothek aktualisieren', settings:'Einstellungen', settingsTitle:'Konfiguration', cfgApiKey:'OMDb API-Key', cfgMaxRequests:'Max. Requests pro Tag', cfgStartupLanguage:'Startsprache', cfgScanStartup:'Scan beim Start', cfgMoviesPath:'Pfad Filme', cfgSeriesPath:'Pfad Serien', configNote:'Änderungen werden in config.txt neben dem Python-Skript gespeichert. Neue Pfade gelten beim nächsten Bibliotheks-Scan.', saveConfig:'Speichern', savingConfig:'Speichere …', configSaved:'Konfiguration gespeichert.', configLoadFailed:'Konfiguration konnte nicht geladen werden.', configSaveFailed:'Konfiguration konnte nicht gespeichert werden.', cancel:'Abbrechen', yes:'Ja', no:'Nein', exportPdf:'PDF-Liste erstellen', pdfCreating:'PDF wird erstellt …', pdfFailed:'PDF konnte nicht erstellt werden.', noPdfTitles:'Keine sichtbaren Titel für den PDF-Export.', source:'Quelle',
+    resetFilters:'Zurücksetzen', refreshLibrary:'Bibliothek aktualisieren', settings:'Einstellungen', settingsTitle:'Konfiguration', cfgApiKey:'OMDb API-Key', cfgMaxRequests:'Max. Requests pro Tag', cfgStartupLanguage:'Startsprache', cfgScanStartup:'Scan beim Start', cfgWindowsMoviesPath:'Windows: Pfad Filme', cfgWindowsSeriesPath:'Windows: Pfad Serien', cfgLinuxMoviesPath:'Linux: Pfad Filme', cfgLinuxSeriesPath:'Linux: Pfad Serien', configNote:'Das Betriebssystem wird automatisch erkannt. Unter Linux kann direkt smb:// verwendet werden; ein /mnt-Mount ist nicht erforderlich. Neue Pfade gelten beim nächsten Bibliotheks-Scan.', saveConfig:'Speichern', savingConfig:'Speichere …', configSaved:'Konfiguration gespeichert.', configLoadFailed:'Konfiguration konnte nicht geladen werden.', configSaveFailed:'Konfiguration konnte nicht gespeichert werden.', cancel:'Abbrechen', yes:'Ja', no:'Nein', exportPdf:'PDF-Liste erstellen', pdfCreating:'PDF wird erstellt …', pdfFailed:'PDF konnte nicht erstellt werden.', noPdfTitles:'Keine sichtbaren Titel für den PDF-Export.', source:'Quelle',
     lastScan:'letzter Scan', serverDates:'Serverdaten', calls:'Aufrufe', fromDb:'aus DB', omdbNotice:'OMDb-Hinweis',
     todayUsage:'heute lokal gezählt', remainingApprox:'ca. verbleibend', filmServer:'Filmserver', online:'online', offline:'offline', checking:'prüfe …',
     noMatches:'Keine passenden Titel.', noCover:'Kein Cover', openIMDb:'IMDb öffnen', searchTrailer:'Trailer suchen',
@@ -4161,7 +4324,7 @@ const I18N = {{
     allGenres:'All genres', allDirectors:'All directors', allActors:'All actors',
     allAddedDates:'All added dates', last7Days:'Added in last 7 days', last30Days:'Added in last 30 days',
     last90Days:'Added in last 90 days', last365Days:'Added in last year', addedLabel:'On server',
-    resetFilters:'Reset', refreshLibrary:'Update library', settings:'Settings', settingsTitle:'Configuration', cfgApiKey:'OMDb API key', cfgMaxRequests:'Max. requests per day', cfgStartupLanguage:'Startup language', cfgScanStartup:'Scan on startup', cfgMoviesPath:'Movies path', cfgSeriesPath:'Series path', configNote:'Changes are saved to config.txt next to the Python script. New paths apply to the next library scan.', saveConfig:'Save', savingConfig:'Saving …', configSaved:'Configuration saved.', configLoadFailed:'Configuration could not be loaded.', configSaveFailed:'Configuration could not be saved.', cancel:'Cancel', yes:'Yes', no:'No', exportPdf:'Create PDF list', pdfCreating:'Creating PDF …', pdfFailed:'PDF could not be created.', noPdfTitles:'No visible titles to export to PDF.', source:'Source',
+    resetFilters:'Reset', refreshLibrary:'Update library', settings:'Settings', settingsTitle:'Configuration', cfgApiKey:'OMDb API key', cfgMaxRequests:'Max. requests per day', cfgStartupLanguage:'Startup language', cfgScanStartup:'Scan on startup', cfgWindowsMoviesPath:'Windows: movies path', cfgWindowsSeriesPath:'Windows: series path', cfgLinuxMoviesPath:'Linux: movies path', cfgLinuxSeriesPath:'Linux: series path', configNote:'The operating system is detected automatically. Linux can use smb:// directly; no /mnt mount is required. New paths apply to the next library scan.', saveConfig:'Save', savingConfig:'Saving …', configSaved:'Configuration saved.', configLoadFailed:'Configuration could not be loaded.', configSaveFailed:'Configuration could not be saved.', cancel:'Cancel', yes:'Yes', no:'No', exportPdf:'Create PDF list', pdfCreating:'Creating PDF …', pdfFailed:'PDF could not be created.', noPdfTitles:'No visible titles to export to PDF.', source:'Source',
     lastScan:'last scan', serverDates:'server dates', calls:'requests', fromDb:'from DB', omdbNotice:'OMDb notice',
     todayUsage:'locally counted today', remainingApprox:'approx. remaining', filmServer:'Movie server', online:'online', offline:'offline', checking:'checking …',
     noMatches:'No matching titles.', noCover:'No cover', openIMDb:'Open IMDb', searchTrailer:'Search trailer',
@@ -4187,7 +4350,7 @@ const I18N = {{
     allGenres:'Todos los géneros', allDirectors:'Todos los directores', allActors:'Todos los actores',
     allAddedDates:'Todas las fechas', last7Days:'Añadidos en los últimos 7 días', last30Days:'Añadidos en los últimos 30 días',
     last90Days:'Añadidos en los últimos 90 días', last365Days:'Añadidos en el último año', addedLabel:'En el servidor',
-    resetFilters:'Restablecer', refreshLibrary:'Actualizar biblioteca', settings:'Ajustes', settingsTitle:'Configuración', cfgApiKey:'Clave API de OMDb', cfgMaxRequests:'Máx. solicitudes por día', cfgStartupLanguage:'Idioma inicial', cfgScanStartup:'Escanear al iniciar', cfgMoviesPath:'Ruta de películas', cfgSeriesPath:'Ruta de series', configNote:'Los cambios se guardan en config.txt junto al script de Python. Las nuevas rutas se aplican en el próximo escaneo de la biblioteca.', saveConfig:'Guardar', savingConfig:'Guardando …', configSaved:'Configuración guardada.', configLoadFailed:'No se pudo cargar la configuración.', configSaveFailed:'No se pudo guardar la configuración.', cancel:'Cancelar', yes:'Sí', no:'No', exportPdf:'Crear lista PDF', pdfCreating:'Creando PDF …', pdfFailed:'No se pudo crear el PDF.', noPdfTitles:'No hay títulos visibles para exportar a PDF.', source:'Fuente',
+    resetFilters:'Restablecer', refreshLibrary:'Actualizar biblioteca', settings:'Ajustes', settingsTitle:'Configuración', cfgApiKey:'Clave API de OMDb', cfgMaxRequests:'Máx. solicitudes por día', cfgStartupLanguage:'Idioma inicial', cfgScanStartup:'Escanear al iniciar', cfgWindowsMoviesPath:'Windows: ruta de películas', cfgWindowsSeriesPath:'Windows: ruta de series', cfgLinuxMoviesPath:'Linux: ruta de películas', cfgLinuxSeriesPath:'Linux: ruta de series', configNote:'El sistema operativo se detecta automáticamente. Linux puede usar smb:// directamente; no se requiere un montaje /mnt. Las nuevas rutas se aplican en el próximo escaneo.', saveConfig:'Guardar', savingConfig:'Guardando …', configSaved:'Configuración guardada.', configLoadFailed:'No se pudo cargar la configuración.', configSaveFailed:'No se pudo guardar la configuración.', cancel:'Cancelar', yes:'Sí', no:'No', exportPdf:'Crear lista PDF', pdfCreating:'Creando PDF …', pdfFailed:'No se pudo crear el PDF.', noPdfTitles:'No hay títulos visibles para exportar a PDF.', source:'Fuente',
     lastScan:'último escaneo', serverDates:'fechas del servidor', calls:'solicitudes', fromDb:'de la BD', omdbNotice:'Aviso de OMDb',
     todayUsage:'contado localmente hoy', remainingApprox:'aprox. restantes', filmServer:'Servidor multimedia', online:'en línea', offline:'sin conexión', checking:'comprobando …',
     noMatches:'No hay títulos coincidentes.', noCover:'Sin carátula', openIMDb:'Abrir IMDb', searchTrailer:'Buscar tráiler',
@@ -4863,8 +5026,10 @@ async function openConfigDialog() {{
     document.getElementById('cfgMaxRequests').value = String(cfg['Max-Requests'] || '');
     document.getElementById('cfgStartupLanguage').value = ['de','en','es'].includes(cfg['Startup-Language']) ? cfg['Startup-Language'] : 'de';
     document.getElementById('cfgScanStartup').value = cfg['Scan-On-Startup'] ? 'yes' : 'no';
-    document.getElementById('cfgMoviesPath').value = cfg['Movies-Path'] || '';
-    document.getElementById('cfgSeriesPath').value = cfg['Series-Path'] || '';
+    document.getElementById('cfgWindowsMoviesPath').value = cfg['Windows-Movies-Path'] || '';
+    document.getElementById('cfgWindowsSeriesPath').value = cfg['Windows-Series-Path'] || '';
+    document.getElementById('cfgLinuxMoviesPath').value = cfg['Linux-Movies-Path'] || '';
+    document.getElementById('cfgLinuxSeriesPath').value = cfg['Linux-Series-Path'] || '';
   }} catch (error) {{
     if (status) {{
       status.textContent = (error && error.message) ? error.message : t('configLoadFailed');
@@ -4890,8 +5055,10 @@ async function saveConfig(event) {{
     'Max-Requests': Number(document.getElementById('cfgMaxRequests').value),
     'Startup-Language': document.getElementById('cfgStartupLanguage').value,
     'Scan-On-Startup': document.getElementById('cfgScanStartup').value === 'yes',
-    'Movies-Path': document.getElementById('cfgMoviesPath').value.trim(),
-    'Series-Path': document.getElementById('cfgSeriesPath').value.trim()
+    'Windows-Movies-Path': document.getElementById('cfgWindowsMoviesPath').value.trim(),
+    'Windows-Series-Path': document.getElementById('cfgWindowsSeriesPath').value.trim(),
+    'Linux-Movies-Path': document.getElementById('cfgLinuxMoviesPath').value.trim(),
+    'Linux-Series-Path': document.getElementById('cfgLinuxSeriesPath').value.trim()
   }};
   if (button) {{ button.disabled = true; button.textContent = t('savingConfig'); }}
   if (status) {{ status.textContent = ''; status.className = 'config-status'; }}
@@ -4930,7 +5097,7 @@ async function saveConfig(event) {{
 
 
 class CatalogWebHandler(BaseHTTPRequestHandler):
-    server_version = "MedienKatalog/4.15.6"
+    server_version = "MedienKatalog/4.15.7"
 
     def _send_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
@@ -5019,8 +5186,10 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                     "Max-Requests": int(cfg.get("Max-Requests") or OMDB_DAILY_LIMIT),
                     "Startup-Language": str(cfg.get("Startup-Language") or "de"),
                     "Scan-On-Startup": bool(cfg.get("Scan-On-Startup", True)),
-                    "Movies-Path": str(cfg.get("Movies-Path") or DEFAULT_MOVIES_SOURCE),
-                    "Series-Path": str(cfg.get("Series-Path") or DEFAULT_SERIES_SOURCE),
+                    "Windows-Movies-Path": str(cfg.get("Windows-Movies-Path") or DEFAULT_WINDOWS_MOVIES_SOURCE),
+                    "Windows-Series-Path": str(cfg.get("Windows-Series-Path") or DEFAULT_WINDOWS_SERIES_SOURCE),
+                    "Linux-Movies-Path": str(cfg.get("Linux-Movies-Path") or DEFAULT_LINUX_MOVIES_SOURCE),
+                    "Linux-Series-Path": str(cfg.get("Linux-Series-Path") or DEFAULT_LINUX_SERIES_SOURCE),
                 },
             })
             return
@@ -5072,8 +5241,10 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                     "Max-Requests": data.get("Max-Requests", OMDB_DAILY_LIMIT),
                     "Startup-Language": data.get("Startup-Language", "de"),
                     "Scan-On-Startup": data.get("Scan-On-Startup", True),
-                    "Movies-Path": data.get("Movies-Path", ""),
-                    "Series-Path": data.get("Series-Path", ""),
+                    "Windows-Movies-Path": data.get("Windows-Movies-Path", ""),
+                    "Windows-Series-Path": data.get("Windows-Series-Path", ""),
+                    "Linux-Movies-Path": data.get("Linux-Movies-Path", ""),
+                    "Linux-Series-Path": data.get("Linux-Series-Path", ""),
                 }
                 config = save_app_config(values)
                 self.app.apply_config(config)
@@ -5084,8 +5255,10 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                         "Max-Requests": config["Max-Requests"],
                         "Startup-Language": config["Startup-Language"],
                         "Scan-On-Startup": config["Scan-On-Startup"],
-                        "Movies-Path": config["Movies-Path"],
-                        "Series-Path": config["Series-Path"],
+                        "Windows-Movies-Path": config["Windows-Movies-Path"],
+                        "Windows-Series-Path": config["Windows-Series-Path"],
+                        "Linux-Movies-Path": config["Linux-Movies-Path"],
+                        "Linux-Series-Path": config["Linux-Series-Path"],
                     },
                 })
                 return
@@ -5239,8 +5412,9 @@ class WebAppContext:
         self.args.omdb_key = self.omdb_key
         self.args.startup_language = str(config.get("Startup-Language") or "de")
         self.args.scan_on_startup = bool(config.get("Scan-On-Startup", True))
-        self.args.movies_path = str(config.get("Movies-Path") or DEFAULT_MOVIES_SOURCE)
-        self.args.series_path = str(config.get("Series-Path") or DEFAULT_SERIES_SOURCE)
+        active_movies, active_series = _active_platform_paths(config)
+        self.args.movies_path = active_movies
+        self.args.series_path = active_series
         self.args.quelle = configured_source_summary(self.args)
 
 
@@ -5295,6 +5469,25 @@ def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str
     connection = open_database(args.db)
     connection.close()
 
+    context = WebAppContext(args=args, password=password, omdb_key=omdb_key)
+
+    # Port zuerst reservieren. Läuft noch eine ältere Instanz auf dem Standardport,
+    # verwenden wir automatisch einen freien Betriebssystem-Port statt abzubrechen.
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), CatalogWebHandler)
+    except OSError as exc:
+        if getattr(exc, "errno", None) not in {48, 98, 10048}:
+            raise
+        requested_port = args.port
+        server = ThreadingHTTPServer((args.host, 0), CatalogWebHandler)
+        args.port = int(server.server_address[1])
+        print(
+            f"Hinweis: Port {requested_port} ist bereits belegt; "
+            f"Medienkatalog verwendet automatisch Port {args.port}.",
+            file=sys.stderr,
+        )
+    server.app = context  # type: ignore[attr-defined]
+
     if not args.kein_startscan:
         try:
             count, removed, api_requests, reused_metadata = scan_into_database(
@@ -5309,9 +5502,6 @@ def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str
         except (CatalogError, OmdbFatalError, OSError, sqlite3.Error) as exc:
             print(f"Warnung: Startscan fehlgeschlagen: {exc}", file=sys.stderr)
 
-    context = WebAppContext(args=args, password=password, omdb_key=omdb_key)
-    server = ThreadingHTTPServer((args.host, args.port), CatalogWebHandler)
-    server.app = context  # type: ignore[attr-defined]
     shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     catalog_url = f"http://{shown_host}:{args.port}/"
     print(f"Medienkatalog läuft unter {catalog_url}")
@@ -5363,7 +5553,7 @@ def parse_args(argv: Sequence[str] | None = None, *, app_config: dict[str, Any] 
 
             Konfiguration:
               config.txt neben dem Skript: API-Key, Max-Requests, Startup-Language,
-              Scan-On-Startup, Movies-Path und Series-Path.
+              Scan-On-Startup sowie getrennte Windows-/Linux-Medienpfade.
 
             Umgebungsvariablen:
               SMB_BENUTZER  Benutzername für eine smb://-Freigabe (optional)
@@ -5448,6 +5638,10 @@ def parse_args(argv: Sequence[str] | None = None, *, app_config: dict[str, Any] 
     if args.quelle:
         args.movies_path = _join_media_child(args.quelle, "Filme")
         args.series_path = _join_media_child(args.quelle, "Serien")
+    # Auch explizite CLI-Pfade plattformgerecht behandeln: UNC -> smb:// unter
+    # Linux, smb:// -> UNC unter Windows.
+    args.movies_path = _platform_media_path(str(args.movies_path))
+    args.series_path = _platform_media_path(str(args.series_path))
     # ``quelle`` bleibt als rein informative Legacy-Eigenschaft erhalten.
     args.quelle = configured_source_summary(args)
     if args.smb_timeout < 1:
