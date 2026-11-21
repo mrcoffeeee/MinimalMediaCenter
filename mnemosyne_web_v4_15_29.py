@@ -25,6 +25,7 @@ Für SMB wird das optionale Paket ``smbprotocol`` benötigt:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import difflib
 import getpass
@@ -32,9 +33,12 @@ import hashlib
 import html
 import ipaddress
 import json
+import secrets
+import struct
 import os
 import re
 import socket
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -54,7 +58,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.8"
+VERSION = "4.15.29"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
 IMDB_GRAPHQL_ENDPOINT = "https://caching.graphql.imdb.com/"
@@ -78,8 +82,8 @@ DEFAULT_SCAN_ON_STARTUP = True
 
 
 def config_path() -> Path:
-    """Konfiguration immer neben dem Python-Skript suchen."""
-    return Path(__file__).resolve().parent / CONFIG_FILENAME
+    """Persistente Konfiguration im data-Unterordner."""
+    return data_directory() / CONFIG_FILENAME
 
 
 def _unc_to_smb_uri(target: str) -> str:
@@ -280,7 +284,7 @@ def load_app_config() -> dict[str, Any]:
 
 
 def save_app_config(values: dict[str, Any]) -> dict[str, Any]:
-    """Validate and atomically persist config.txt next to the script."""
+    """Validate and atomically persist data/config.txt."""
     normalized = _normalize_app_config(values, seen_keys=set(values))
     lines = [
         "# Media Catalog Configuration",
@@ -1532,16 +1536,74 @@ def write_json(path: Path, records: Sequence[CatalogRecord]) -> None:
 
 
 def application_directory() -> Path:
-    """Stabiler Programmordner, unabhängig vom Windows-Arbeitsverzeichnis."""
+    """Beschreibbarer Ordner neben der tatsächlich gestarteten AppImage."""
+    appimage = os.environ.get("APPIMAGE", "")
+    if appimage and getattr(sys, "frozen", False):
+        return Path(appimage).expanduser().absolute().parent
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def data_directory() -> Path:
+    """Gemeinsamer, beschreibbarer Datenordner neben AppImage bzw. Python-Datei."""
+    return application_directory() / "data"
+
+
+def migrate_legacy_data() -> None:
+    """Einmalige, nicht-destruktive Übernahme der bisherigen Speicherorte.
+
+    Bestehende Dateien in data/ haben immer Vorrang. Alte Dateien bleiben als
+    Sicherheitskopien erhalten. Für SQLite wird die Backup-API benutzt, damit
+    auch Daten aus einer möglichen WAL-Datei übernommen werden.
+    """
+    old = application_directory()
+    new = data_directory()
+    new.mkdir(parents=True, exist_ok=True)
+    for filename in (CONFIG_FILENAME,):
+        source, target = old / filename, new / filename
+        if source.is_file() and not target.exists():
+            try:
+                shutil.copy2(source, target)
+                print(f"Mnemosyne: {filename} nach data/ übernommen.", file=sys.stderr)
+            except OSError as exc:
+                raise OSError(f"Konfiguration konnte nicht nach data/ übernommen werden: {exc}") from exc
+
+    source, target = old / "medien_katalog.sqlite3", new / "medien_katalog.sqlite3"
+    if source.is_file() and not target.exists():
+        temporary = new / "medien_katalog.sqlite3.migration.tmp"
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            with sqlite3.connect(f"file:{quote(str(source), safe='/')}?mode=ro", uri=True) as original:
+                with sqlite3.connect(temporary) as destination:
+                    original.backup(destination)
+            os.replace(temporary, target)
+            print("Mnemosyne: SQLite-Datenbank nach data/ übernommen.", file=sys.stderr)
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"Bestehende Datenbank konnte nicht sicher migriert werden: {exc}") from exc
+
+    source, target = old / "cover_cache", new / "cover_cache"
+    if source.is_dir() and not target.exists():
+        try:
+            shutil.copytree(source, target)
+            print("Mnemosyne: Cover-Cache nach data/ übernommen.", file=sys.stderr)
+        except OSError as exc:
+            raise OSError(f"Cover-Cache konnte nicht nach data/ übernommen werden: {exc}") from exc
+
+
+def packaged_resource_directory() -> Path:
+    """Unveränderliche Ressourcen im AppImage; im Dev-Modus beim Skript."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "assets"
     return Path(__file__).resolve().parent
 
 
 def default_database_path() -> Path:
     # Beim Doppelklick kann Windows ein anderes Arbeitsverzeichnis verwenden
     # (z. B. System32). Die Datenbank liegt deshalb immer neben dem Skript.
-    return application_directory() / "medien_katalog.sqlite3"
+    return data_directory() / "medien_katalog.sqlite3"
 
 
 def _utc_now() -> str:
@@ -2721,7 +2783,7 @@ def _poster_host_allowed(value: str) -> bool:
 
 
 def _poster_cache_directory() -> Path:
-    return application_directory() / "cover_cache"
+    return data_directory() / "cover_cache"
 
 
 def invalidate_poster_cache(media_id: int, imdb_id: str = "") -> None:
@@ -2771,7 +2833,7 @@ def _download_poster_image(url: str, *, timeout: int = 12) -> tuple[bytes, str]:
     request = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MedienKatalog/4.6",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Mnemosyne/4.6",
             "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Referer": "https://www.imdb.com/",
         },
@@ -2921,7 +2983,7 @@ def search_imdb_titles(query: str, *, limit: int = 10, timeout: int = 12) -> lis
     request = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MedienKatalog/4.6",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Mnemosyne/4.6",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -3097,21 +3159,13 @@ def media_server_status(source: str, *, timeout: float = 1.2) -> tuple[bool, str
 
 
 def background_image_path() -> Path | None:
-    """Liefert background.png/background.jpg neben dem Programm, falls vorhanden."""
-    base = application_directory()
-    try:
-        files = [path for path in base.iterdir() if path.is_file()]
-    except OSError:
-        return None
-    priority = {".png": 0, ".jpg": 1, ".jpeg": 2}
-    candidates = [
-        path for path in files
-        if path.stem.casefold() == "background" and path.suffix.casefold() in priority
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda path: (priority.get(path.suffix.casefold(), 99), path.name.casefold()))
-    return candidates[0]
+    """Standardhintergrund aus dem AppImage, nicht aus dem Datenordner."""
+    base = packaged_resource_directory()
+    for name in ("background.png", "background.jpg", "background.jpeg"):
+        path = base / name
+        if path.is_file():
+            return path
+    return None
 
 
 def _background_version_token(path: Path) -> str:
@@ -3134,8 +3188,8 @@ def _register_pdf_fonts() -> tuple[str, str]:
             "python -m pip install reportlab"
         ) from exc
 
-    regular_name = "MedienKatalogSans"
-    bold_name = "MedienKatalogSansBold"
+    regular_name = "MnemosyneSans"
+    bold_name = "MnemosyneSansBold"
     registered = set(pdfmetrics.getRegisteredFontNames())
     if regular_name in registered and bold_name in registered:
         return regular_name, bold_name
@@ -3228,7 +3282,7 @@ def generate_catalog_pdf(
     lang = language if language in {"de", "en", "es"} else "de"
     text = {
         "de": {
-            "title": "Medienkatalog - IMDb-Liste",
+            "title": "Mnemosyne - IMDb-Liste",
             "created": "Erstellt",
             "count": "Titel",
             "movies": "Filme",
@@ -3250,7 +3304,7 @@ def generate_catalog_pdf(
             "page": "Seite",
         },
         "en": {
-            "title": "Media Library - IMDb List",
+            "title": "Mnemosyne - IMDb List",
             "created": "Created",
             "count": "titles",
             "movies": "movies",
@@ -3272,7 +3326,7 @@ def generate_catalog_pdf(
             "page": "Page",
         },
         "es": {
-            "title": "Catálogo multimedia - Lista IMDb",
+            "title": "Mnemosyne - Lista IMDb",
             "created": "Creado",
             "count": "títulos",
             "movies": "películas",
@@ -3305,7 +3359,7 @@ def generate_catalog_pdf(
         topMargin=15 * mm,
         bottomMargin=15 * mm,
         title=text["title"],
-        author="Medienkatalog",
+        author="Mnemosyne",
     )
     base = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -3819,6 +3873,13 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         plot_de_raw = str(row["german_plot"] or plot_en_raw)
         plot_es_raw = str(row["spanish_plot"] or plot_en_raw)
         plot = html.escape(plot_de_raw)
+        # Keep compact cards fast; lengthy localized plots can be expanded per card.
+        plot_toggle_html = (
+            f'<button class="plot-more" type="button" aria-expanded="false" '
+            f'aria-controls="plot-{int(row["id"])}" data-i18n="plotMore" '
+            f'onclick="togglePlot(this)">Mehr anzeigen</button>'
+            if max(len(plot_en_raw), len(plot_de_raw), len(plot_es_raw)) > 150 else ""
+        )
         genre_raw = str(row["genre"] or "")
         director_raw = str(row["director"] or "")
         actors_raw = str(row["actors"] or "")
@@ -3939,9 +4000,10 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
               data-unknown="{'1' if unknown else '0'}"
               data-added-ts="{server_added_ts}"
               data-original-order="{card_order}">
-              {poster_html}
-              <div class="content">
-                <div class="topline"><span class="kind" data-kind-code="{html.escape(str(row['kind']), quote=True)}">{'Film' if row['kind']=='movie' else 'Serie'}</span><span class="badges">{'<span class="kids-badge" data-i18n="kidsBadge">Kinder</span>' if is_kids else ''}<span class="status" data-status-code="{html.escape(status_code, quote=True)}">{html.escape('Manuell' if manual else status_raw)}</span></span></div>
+              <div class="card-top">
+                {poster_html}
+                <div class="card-summary">
+                  <div class="topline"><span class="kind" data-kind-code="{html.escape(str(row['kind']), quote=True)}">{'Film' if row['kind']=='movie' else 'Serie'}</span><span class="badges">{'<span class="kids-badge" data-i18n="kidsBadge">Kinder</span>' if is_kids else ''}<span class="status" data-status-code="{html.escape(status_code, quote=True)}">{html.escape('Manuell' if manual else status_raw)}</span><button class="favorite-btn" type="button" onclick="toggleFavorite({int(row['id'])})" aria-label="Favorit" title="Favorit">☆</button></span></div>
                 <h2><span class="localized-title">{german_title}</span> <small>{year}</small></h2>
                 <div class="rating">★ {rating}<span>/10</span></div>
                 <div class="facts"><span class="genre-text" data-genre-raw="{html.escape(genre_raw, quote=True)}">{genre}</span>{' · ' if genre and runtime else ''}{runtime}</div>
@@ -3951,7 +4013,11 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
                 {f'<div class="facts actors"><span data-i18n="castLabel">Besetzung</span>: {actors}</div>' if actors else ''}
                 {f'<div class="facts awards"><span data-i18n="awardsLabel">Auszeichnungen</span>: {html.escape(awards_raw)}</div>' if awards_raw else ''}
                 {seasons_html}
-                <p class="localized-plot" data-plot-en="{html.escape(plot_en_raw, quote=True)}" data-plot-de="{html.escape(plot_de_raw, quote=True)}" data-plot-es="{html.escape(plot_es_raw, quote=True)}">{plot}</p>
+                </div>
+              </div>
+              <div class="content card-bottom">
+                <p class="localized-plot" id="plot-{int(row['id'])}" data-plot-en="{html.escape(plot_en_raw, quote=True)}" data-plot-de="{html.escape(plot_de_raw, quote=True)}" data-plot-es="{html.escape(plot_es_raw, quote=True)}">{plot}</p>
+                {plot_toggle_html}
                 <div class="links">{imdb_html}{trailer_html}<button class="play-button" type="button" onclick="startMedia({int(row['id'])}, this, '{'series' if str(row['kind']) == 'series' else 'movie'}')" data-i18n="{'openFolder' if str(row['kind']) == 'series' else 'playFilm'}">{'Ordner öffnen' if str(row['kind']) == 'series' else 'Film starten'}</button><span>{int(row['file_count'])} <span data-i18n="files">Datei(en)</span></span></div>
                 <details>
                   <summary data-i18n="sourceCorrection">Quelle &amp; Korrektur</summary>
@@ -3978,6 +4044,36 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
             </article>
             """
         )
+
+    # The overview shows ONLY the newest 20 film/series tiles, not the full catalog.
+    # No OMDb/IMDb requests, no extra tables, and no second library scan.
+    by_date = sorted(
+        rows,
+        key=lambda row: str(row["server_added_at"] or row["created_at"] or ""), reverse=True,
+    )[:20]
+    featured_html: list[str] = []
+    for row in by_date:
+        mid = int(row["id"])
+        title_en = str(row["title"] or row["source_title"] or "")
+        title_de = str(row["german_title"] or title_en)
+        title_es = str(row["spanish_title_imdb"] or title_en)
+        poster_ok = bool(_safe_poster_url(str(row["poster"] or ""))) or bool(IMDB_ID_RE.fullmatch(str(row["imdb_id"] or "")))
+        photo = (
+            f'<img loading="lazy" decoding="async" src="/poster/{mid}?v={_poster_version_token(row)}" '
+            f'alt="" onerror="this.style.display=\'none\';">'
+            if poster_ok else '<div class="featured-placeholder" aria-hidden="true">▷</div>'
+        )
+        featured_html.append(
+            f'<button type="button" class="featured-item" data-media-id="{mid}" onclick="showFeatured({mid})" '
+            f'aria-label="{html.escape(title_de, quote=True)}">'
+            f'{photo}<span class="featured-title" '
+            f'data-title-en="{html.escape(title_en, quote=True)}" '
+            f'data-title-de="{html.escape(title_de, quote=True)}" '
+            f'data-title-es="{html.escape(title_es, quote=True)}">'
+            f'{html.escape(title_de)}</span></button>'
+        )
+    movie_count = sum(1 for row in rows if row["kind"] == "movie")
+    series_count = len(rows) - movie_count
 
     last_scan = html.escape(meta.get("last_scan_at", "noch nicht"))
     source = html.escape(configured_source_summary(args))
@@ -4008,14 +4104,32 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         )
     else:
         body_background_css = "background:var(--bg);"
+    if background_path is not None:
+        # Keep the user-provided background visible below the translucent Metro panels.
+        metro_background_image = (
+            "linear-gradient(90deg,rgba(15,29,43,.72) 0%,rgba(15,29,43,.55) 65%,"
+            "rgba(15,29,43,.30) 100%),"
+            f"url('/background?v={background_token}')"
+        )
+    else:
+        metro_background_image = "linear-gradient(130deg,#1d2936 0%,#182533 60%,#213140 100%)"
     notice_html = f'<div class="message ok">{html.escape(notice)}</div>' if notice else ""
     error_html = f'<div class="message error">{html.escape(error)}</div>' if error else ""
+    browser_warning_html = (
+        '<div class="message browser-warning" role="status">'
+        '<strong data-i18n="browserFallbackTitle">Browser-Hinweis:</strong>'
+        '<span data-i18n="browserFallbackText">Der optimierte Browsermodus ist nicht verfügbar. Mnemosyne läuft im Standardbrowser; installierte Erweiterungen können die Oberfläche verlangsamen. Installiere Chromium, Chrome, Edge oder Brave für den isolierten Modus.</span>'
+        '</div>'
+        if bool(getattr(args, "browser_fallback", False)) else ""
+    )
     return f"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Medienkatalog</title>
+<title>Mnemosyne</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="/mnemosyne_icon.png">
 <style>
 :root {{ color-scheme: dark; --bg:#111318; --panel:#1a1e25; --muted:#a7afbd; --line:#2b313b; --accent:#f5c451; --play:#36c978; --play-hover:#48da8a; }}
 * {{ box-sizing:border-box; }}
@@ -4023,7 +4137,9 @@ body {{ margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; {body
 header {{ position:sticky; top:0; z-index:5; background:rgba(17,19,24,.93); backdrop-filter:blur(12px); border-bottom:1px solid var(--line); padding:12px max(18px,4vw) 11px; box-shadow:0 6px 24px rgba(0,0,0,.14); }}
 .header-main {{ display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }}
 .brand-row {{ display:flex; align-items:center; gap:12px; min-width:0; }}
-h1 {{ margin:0; font-size:1.3rem; white-space:nowrap; }}
+h1 {{ margin:0; font-size:1.08rem; white-space:nowrap; display:flex; align-items:baseline; gap:6px; }}
+.brand-title {{ display:inline-block; font-family:Impact,Haettenschweiler,"Arial Narrow Bold","Liberation Sans Narrow","Nimbus Sans Narrow","DejaVu Sans Condensed",sans-serif; font-size:1.72rem; line-height:.82; font-weight:900; letter-spacing:.025em; text-transform:uppercase; font-stretch:condensed; color:#fff; text-shadow:0 1px 0 rgba(255,255,255,.05); }}
+.brand-separator {{ color:#697382; font-weight:500; }}
 .header-actions {{ display:flex; gap:7px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
 .header-actions form {{ margin:0; }}
 .header-actions button,.header-actions select {{ min-height:36px; padding:7px 10px; font-size:.8rem; }}
@@ -4055,6 +4171,8 @@ button.secondary {{ background:#303745; color:#fff; margin-top:8px; }}
 .server-led.checking {{ background:#e0b64d; box-shadow:0 0 7px rgba(224,182,77,.65); }}
 main {{ padding:24px max(18px,4vw) 50px; }}
 .message {{ border-radius:8px; padding:10px 12px; margin-bottom:16px; }} .ok {{ background:#173a2a; }} .error {{ background:#4b2024; }}
+.browser-warning {{ background:#3a2d12; border:1px solid #7f6528; color:#ffe7a3; box-shadow:0 6px 20px rgba(0,0,0,.18); }}
+.browser-warning strong {{ color:#ffd66b; margin-right:5px; }}
 .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:18px; }}
 .card {{ display:grid; grid-template-columns:150px 1fr; min-height:225px; background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:0 8px 26px rgba(0,0,0,.16); }}
 .poster-slot {{ width:150px; height:225px; background:#0d0f13; }}
@@ -4144,13 +4262,362 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
 @media (max-width:760px) {{ .header-main {{ align-items:flex-start; }} .header-actions {{ justify-content:flex-start; width:100%; }} .search-row {{ flex-wrap:wrap; }} .search-row .main-search,.search-row .filename-search {{ flex:1 1 100%; width:100%; }} .filter-toggle,.search-row .reset-filters {{ flex:1 1 auto; }} .filter-panel {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} }}
 @media (max-width:480px) {{ .brand-row {{ width:100%; justify-content:space-between; }} .filter-panel {{ grid-template-columns:1fr; }} }}
 @media (max-width:560px) {{ .grid {{ grid-template-columns:1fr; }} .card {{ grid-template-columns:105px 1fr; }} .poster-slot,.poster {{ width:105px; height:158px; }} .random-layout {{ grid-template-columns:95px minmax(0,1fr); gap:12px; }} .random-poster {{ width:95px; height:143px; }} .alphabet-nav {{ right:3px; padding:3px 2px; }} .alphabet-nav button {{ width:20px; min-height:18px; font-size:.61rem; }} }}
+
+/* Mnemosyne Metro UI – no external fonts, icon libraries, animation loops or new data calls. */
+:root {{--bg:#1a2634;--panel:#212f3c;--line:#334554;--muted:#b7c7d7;--accent:#81c9e8;--play:#35b7b1;--play-hover:#44cec4}}
+html {{scroll-behavior:smooth}}
+body {{background-color:#142332 !important;background-image:{metro_background_image} !important;background-size:cover !important;background-position:center center !important;background-repeat:no-repeat !important;background-attachment:fixed !important;font-family:'Segoe UI','Noto Sans','DejaVu Sans',system-ui,sans-serif;color:#f1f5fa}}
+header {{position:sticky;top:0;z-index:10;background:rgba(28,43,58,.95);border-bottom:1px solid #344655;backdrop-filter:none;box-shadow:none;padding:15px 28px}}
+.header-main {{flex-wrap:nowrap;gap:24px}}
+.brand-row {{gap:16px;flex:0 0 auto}}
+.metro-logo {{width:52px;height:52px;flex:none;display:grid;place-items:center;border-right:1px solid #536879;padding-right:10px}}
+.metro-logo svg {{display:block}}
+.metro-brand-text {{display:flex;flex-direction:column;gap:4px}}
+.brand-title {{font-family:'Montserrat','Avenir Next','Century Gothic','Gotham','DejaVu Sans',sans-serif;font-size:1.65rem;letter-spacing:.13em;font-weight:750;line-height:1.05;font-stretch:normal;text-shadow:none}}
+.metro-brand-subtitle {{font-size:.64rem;font-weight:650;letter-spacing:.27em;color:#a4c0d4;white-space:nowrap}}
+.header-actions {{gap:9px;flex-wrap:nowrap}}
+.header-actions button,.header-actions select {{font-size:.8rem;min-height:37px;padding:9px 12px}}
+button {{border-radius:3px;transition:background-color .1s ease, border-color .1s ease}}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible {{outline:2px solid #8bdcef;outline-offset:2px}}
+input[type=search],input[name=imdb],select {{background:#142332;border:1px solid #415668;border-radius:3px;color:#f5f8fd}}
+.metro-layout {{display:grid;grid-template-columns:218px minmax(0,1fr);min-height:calc(100vh - 83px)}}
+.metro-sidebar {{background:rgba(27,42,58,.89);border-right:1px solid #344b5d;position:sticky;top:83px;height:calc(100vh - 83px);display:flex;flex-direction:column;padding:34px 0 18px}}
+.metro-nav-btn {{display:flex;align-items:center;gap:17px;width:100%;text-align:left;border-radius:0;background:transparent;color:#dfecf4;padding:18px 22px;font-size:.94rem;font-weight:500;min-height:60px}}
+.metro-nav-btn:hover {{background:#2b3c51}}
+.metro-nav-btn.active,.metro-nav-btn.active:hover {{background:#6147a7;color:#fff}}
+.metro-nav-icon {{font-family:'Segoe UI Symbol',sans-serif;font-size:1.55rem;width:30px;text-align:center;line-height:1}}
+.metro-sidebar-footer {{margin-top:auto;padding:14px 22px;color:#7d94a6;font-size:.67rem;letter-spacing:.14em}}
+.metro-sidebar-footer span {{display:block;letter-spacing:.04em;margin-top:5px}}
+.metro-content {{min-width:0;padding:23px 27px 60px}}
+.metro-overview {{display:block;margin-bottom:26px}}
+.metro-overview[hidden] {{display:none !important}}
+.metro-metrics {{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}
+.metric-tile {{min-height:121px;border-radius:0;display:grid;grid-template-columns:68px auto;grid-template-rows:1fr 1fr;align-items:center;justify-content:stretch;column-gap:18px;text-align:left;padding:20px 28px;color:#fff;box-shadow:none}}
+.metric-tile:hover {{filter:brightness(1.09)}}
+.metric-movies {{background:#195a81}}
+.metric-series {{background:#227d8d}}
+.metric-all {{background:#614a99}}
+.metric-icon {{grid-row:1/3;font-size:3rem;font-weight:300;line-height:1;text-align:center;color:#f0fbff}}
+.metric-number {{font-size:2.7rem;font-weight:400;line-height:1;letter-spacing:.02em}}
+.metric-label {{font-size:.9rem;font-weight:400;opacity:.88;align-self:start}}
+.metro-section-title {{display:flex;align-items:center;justify-content:space-between;margin:30px 0 16px;gap:12px}}
+.metro-section-title h2,.metro-library-heading h2 {{margin:0;font-size:1.35rem;letter-spacing:.005em;font-weight:580}}
+.metro-all-link {{background:none;color:#c9dde9;border:0;font-weight:500;font-size:.86rem}}
+.metro-all-link:hover {{background:#2b4052}}
+.metro-featured {{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;align-items:start}}
+.featured-item {{min-width:0;padding:0;background:rgba(28,43,57,.95);color:#e7f0f8;border:1px solid #344858;border-radius:0;text-align:left;overflow:hidden}}
+.featured-item:hover {{background:#2c4255;border-color:#6394a6}}
+.featured-item img,.featured-placeholder {{display:block;width:100%;height:clamp(190px,19vw,305px);object-fit:contain;object-position:center center;background:rgba(10,22,32,.96)}}
+.featured-placeholder {{display:grid;place-items:center;font-size:3rem;color:#9dacc0}}
+.featured-title {{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 9px 10px;font-weight:560;font-size:.83rem}}
+.metro-library-section[hidden],.alphabet-nav[hidden] {{display:none !important}}
+.metro-library-heading {{display:flex;align-items:center;gap:13px;margin:20px 0 14px;scroll-margin-top:100px}}
+.metro-count {{background:#344b5f;padding:3px 10px;font-size:.8rem;color:#d4e1eb}}
+.search-row {{margin:0 0 12px;gap:8px}}
+.search-row input {{min-height:44px}}
+.filter-panel {{background:#1e2e3d;border-color:#334c5f;border-radius:0;margin:0 0 10px}}
+.meta {{color:#8099ae;font-size:.72rem;margin:12px 0 20px;line-height:1.45}}
+.server-health {{background:transparent;border-color:#435667;border-radius:3px}}
+.server-led.online {{box-shadow:none}}
+main {{padding:0}}
+.grid {{grid-template-columns:repeat(auto-fill,minmax(345px,1fr));gap:12px}}
+.card {{background:rgba(36,51,65,.93);border:1px solid #3a4a58;border-radius:0;box-shadow:none;content-visibility:auto;contain-intrinsic-size:auto 290px}}
+.card:hover {{border-color:#6289a3}}
+.content {{padding:13px 14px}}
+.kind,.status,.kids-badge {{border-radius:2px;border-color:#546475}}
+.card h2 {{font-size:1.06rem;font-weight:660;letter-spacing:.005em}}
+.card h2 small {{font-weight:400}}
+.rating {{color:#7dd8e8}}
+.links {{gap:9px}}
+a {{color:#a5dbef}}
+.trailer-link {{border-radius:2px;background:#2d4456;color:#c5e8f2;border-color:#527589}}
+.trailer-link:hover {{background:#365b70;color:#fff}}
+.play-button {{background:#25877f;border-radius:2px;color:#fff;border-color:#309d95;box-shadow:none}}
+.play-button:hover {{background:#2f9b91}}
+.random-movie-button {{background:#6952aa}}
+.pdf-button {{background:#277990}}
+.config-button,.config-close,.reset-filters,.filter-toggle {{background:#34485a;border-color:#557084;border-radius:3px}}
+.favorite-btn {{padding:0 4px;background:transparent;color:#98adbf;font-size:1.3rem;line-height:1.1;border:0}}
+.favorite-btn:hover,.favorite-btn.active {{color:#e6c36e;background:transparent}}
+.alphabet-nav {{border-radius:2px;right:3px;background:#1a2a39;border-color:#355168;box-shadow:none;backdrop-filter:none}}
+.card {{scroll-margin-top:102px}}
+dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6175;border-radius:4px}}
+.browser-warning {{border-radius:2px;background:#494021;color:#fff0bd}}
+@media(max-width:1250px){{.metro-layout{{grid-template-columns:175px minmax(0,1fr)}}.metro-sidebar{{padding-top:17px}}.metro-nav-btn{{padding:15px 17px}}.metro-content{{padding:20px 19px 40px}}.metric-tile{{padding:16px 18px;grid-template-columns:46px auto;column-gap:12px}}.metric-icon{{font-size:2.5rem}}.metro-featured{{grid-template-columns:repeat(4,minmax(0,1fr))}}.featured-item img,.featured-placeholder{{height:clamp(165px,24vw,275px)}}.header-actions{{justify-content:flex-end}}}}
+@media(max-width:950px){{.header-actions{{flex-wrap:wrap}}header{{padding:12px 16px}}.header-main{{flex-wrap:wrap}}.metro-layout{{grid-template-columns:1fr}}.metro-sidebar{{height:auto;top:0;position:static;flex-direction:row;overflow-x:auto;padding:0;border-bottom:1px solid #405769}}.metro-nav-btn{{min-height:52px;width:auto;white-space:nowrap;padding:12px 16px}}.metro-nav-icon{{font-size:1.2rem;width:22px}}.metro-sidebar-footer{{display:none}}.metro-metrics{{gap:8px}}.metro-featured{{grid-template-columns:repeat(3,minmax(0,1fr))}}.featured-item img,.featured-placeholder{{height:clamp(200px,40vw,300px)}}}}
+@media(max-width:600px){{.metro-logo{{width:40px;height:40px}}.metro-logo svg{{width:38px;height:38px}}.brand-title{{font-size:1.25rem}}.metro-brand-subtitle{{font-size:.47rem}}.metro-content{{padding:16px 12px 35px}}.metro-metrics{{grid-template-columns:repeat(3,minmax(0,1fr))}}.metric-tile{{padding:9px;grid-template-columns:1fr;grid-template-rows:auto auto;min-height:92px;gap:3px}}.metric-icon{{display:none}}.metric-number{{font-size:1.85rem}}.metric-label{{font-size:.74rem}}.metro-featured{{grid-template-columns:repeat(2,minmax(0,1fr))}}.grid{{grid-template-columns:1fr}}.card{{grid-template-columns:105px minmax(0,1fr)}}.poster-slot,.poster{{width:105px;height:158px}}.header-actions button{{padding:7px}}.metro-nav-btn{{font-size:.77rem;gap:7px;padding:9px}}}}
+/* v4.15.19: poster and facts in a two-column header; plot and actions full width.
+   Alphabet keeps a dedicated right gutter; the last-letter tail is added only on demand. */
+.metro-content {{padding-right:106px}}
+.metro-library-section .grid {{
+  grid-template-columns:repeat(auto-fill,minmax(min(100%,250px),1fr));
+  gap:14px;
+  align-items:stretch;
+}}
+.metro-library-section .card {{
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+  min-height:0;
+  grid-template-columns:none;
+  contain-intrinsic-size:auto 590px;
+  background:rgba(33,49,64,.93);
+}}
+.metro-library-section .card .card-top {{
+  display:grid;
+  grid-template-columns:minmax(95px,43%) minmax(0,1fr);
+  align-items:start;
+  column-gap:10px;
+  padding:11px 11px 0;
+  width:100%;
+  min-width:0;
+}}
+.metro-library-section .card .poster-slot {{
+  width:100%;
+  height:auto;
+  aspect-ratio:2/3;
+  min-height:0;
+  background:rgba(12,23,33,.7);
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  overflow:hidden;
+}}
+.metro-library-section .card .poster {{
+  display:block;
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  object-position:center;
+}}
+.metro-library-section .card .poster.placeholder {{display:grid;place-items:center}}
+.metro-library-section .card .poster.poster-fallback[style*="none"] {{display:none}}
+.metro-library-section .card .card-summary {{min-width:0;display:flex;flex-direction:column;gap:2px}}
+.metro-library-section .card .topline {{gap:4px;flex-wrap:wrap;font-size:.68rem}}
+.metro-library-section .card .badges {{gap:3px;max-width:100%}}
+.metro-library-section .card .kind,.metro-library-section .card .status,.metro-library-section .card .kids-badge {{font-size:.64rem;padding:2px 4px}}
+.metro-library-section .card .favorite-btn {{font-size:1.1rem}}
+.metro-library-section .card h2 {{font-size:.95rem;line-height:1.24;margin:5px 0 3px;overflow-wrap:anywhere}}
+.metro-library-section .card h2 small {{font-size:.73rem;white-space:normal}}
+.metro-library-section .card .card-summary .rating {{font-size:1rem;margin-bottom:2px}}
+.metro-library-section .card .facts {{font-size:.73rem;line-height:1.34;overflow-wrap:anywhere}}
+.metro-library-section .card .content.card-bottom {{
+  flex:1;
+  width:100%;
+  min-width:0;
+  padding:11px 12px 10px;
+  display:flex;
+  flex-direction:column;
+}}
+.metro-library-section .card .localized-plot {{font-size:.83rem;line-height:1.43;overflow-wrap:break-word;margin:0 0 7px}}
+.metro-library-section .card .links {{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  align-items:stretch;
+  gap:7px;
+  width:100%;
+  padding-top:9px;
+  margin-top:auto;
+}}
+.metro-library-section .card .links a {{
+  display:flex;
+  min-width:0;
+  min-height:32px;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  font-size:.79rem;
+  border:1px solid #49657c;
+  padding:5px 4px;
+  text-decoration:none;
+  background:rgba(35,58,75,.78);
+  color:#c7e3ee;
+}}
+.metro-library-section .card .links a.trailer-link {{background:#28475b;border-color:#53788e}}
+.metro-library-section .card .links .play-button {{
+  grid-column:1 / -1;
+  width:100%;
+  min-height:34px;
+  text-align:center;
+}}
+.metro-library-section .card .links > span {{
+  grid-column:1 / -1;
+  text-align:center;
+  color:#a6b9c8;
+  font-size:.73rem;
+}}
+.metro-library-section .card details {{width:100%;min-width:0;margin-top:8px}}
+.metro-library-section .card .paths {{overflow-wrap:anywhere}}
+.alphabet-jump-tail {{height:0;pointer-events:none}}
+.alphabet-nav {{right:36px;width:34px;padding:6px 4px;align-items:center;z-index:9}}
+.alphabet-nav button {{min-width:24px;min-height:20px}}
+@media (max-width:1050px) {{
+  .metro-library-section .grid {{grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr))}}
+  .metro-content {{padding-right:88px}}
+  .alphabet-nav {{right:28px;width:31px;padding:4px 2px}}
+}}
+@media (max-width:600px) {{
+  .metro-content {{padding-right:76px}}
+  .metro-library-section .grid {{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr));gap:9px}}
+  .metro-library-section .card .card-top {{grid-template-columns:minmax(90px,41%) minmax(0,1fr);gap:8px;padding:9px 9px 0}}
+  .metro-library-section .card .content.card-bottom {{padding:10px 9px}}
+  .alphabet-nav {{right:22px;width:29px}}
+}}
+@media (max-width:430px) {{
+  .metro-library-section .grid {{grid-template-columns:1fr}}
+  .metro-library-section .card .card-top {{grid-template-columns:minmax(94px,38%) minmax(0,1fr)}}
+}}
+
+
+/* v4.15.19 – Overview posters: card == image width. No crop, no wide letterbox. */
+.metro-layout.showing-overview .metro-content {{padding-right:27px}}
+.metro-featured {{
+  grid-template-columns:repeat(auto-fill, 190px);
+  gap:13px;
+  align-items:start;
+  justify-content:start;
+}}
+.metro-featured .featured-item {{width:190px;max-width:100%;min-width:0;align-self:start}}
+.metro-featured .featured-item img {{
+  display:block;
+  width:100%;
+  height:auto;
+  max-width:100%;
+  min-height:0;
+  aspect-ratio:auto;
+  object-fit:contain;
+  object-position:center;
+  background:none;
+}}
+.metro-featured .featured-placeholder {{width:100%;height:auto;aspect-ratio:2 / 3;min-height:0}}
+.metro-featured .featured-title {{
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+  white-space:normal;
+  line-height:1.3;
+  min-height:2.75em;
+  padding:7px 8px;
+  font-size:.78rem;
+}}
+.metro-sidebar-footer {{letter-spacing:.07em;line-height:1.5}}
+.metro-sidebar-footer strong {{color:#bdcddd;font-weight:650;letter-spacing:.11em}}
+.metro-sidebar-footer .metro-author-line {{
+  display:block;
+  margin-top:5px;
+  font-size:inherit;
+  letter-spacing:.04em;
+  line-height:1.5;
+  color:inherit;
+}}
+@media (max-width:950px) {{
+  .metro-featured {{grid-template-columns:repeat(auto-fill, 170px)}}
+  .metro-featured .featured-item {{width:170px}}
+  .metro-layout.showing-overview .metro-content {{padding-right:19px}}
+}}
+@media (max-width:600px) {{
+  .metro-featured {{grid-template-columns:repeat(auto-fill, minmax(132px, 1fr));gap:10px}}
+  .metro-featured .featured-item {{width:100%}}
+  .metro-layout.showing-overview .metro-content {{padding-right:12px}}
+}}
+
+/* v4.15.19: larger responsive posters, with complete multiline titles.
+   Film/series listing cards are intentionally left untouched. */
+.metro-layout.showing-overview .metro-content {{padding:26px 34px 76px}}
+.metro-layout.showing-overview .metro-overview {{max-width:1510px}}
+.metro-layout.showing-overview .metro-metrics {{max-width:1070px;gap:12px}}
+.metro-layout.showing-overview .metric-tile {{min-height:114px}}
+.metro-layout.showing-overview .metro-section-title {{justify-content:flex-start;gap:14px;margin:30px 0 17px}}
+.metro-layout.showing-overview .metro-featured {{
+  display:grid;
+  grid-template-columns:repeat(10,minmax(0,1fr));
+  gap:10px;
+  max-width:1510px;
+  align-items:stretch;
+}}
+.metro-layout.showing-overview .featured-item {{
+  width:auto;min-width:0;max-width:none;
+  height:100%;
+  display:flex;flex-direction:column;
+  background:rgba(18,39,56,.76);
+  border:1px solid rgba(125,173,197,.26);
+  transition:background-color .14s ease,border-color .14s ease;
+}}
+.metro-layout.showing-overview .featured-item:hover {{background:rgba(33,66,88,.93);border-color:#8eb6c9}}
+.metro-layout.showing-overview .featured-item img {{
+  width:100%;height:auto;min-height:0;max-width:100%;
+  aspect-ratio:2 / 3;object-fit:contain;object-position:center;
+  background:rgba(9,19,29,.20);
+}}
+.metro-layout.showing-overview .featured-placeholder {{width:100%;aspect-ratio:2/3}}
+.metro-layout.showing-overview .featured-title {{
+  flex:1;display:block;overflow:visible;white-space:normal;
+  overflow-wrap:anywhere;word-break:normal;
+  line-height:1.35;padding:9px 8px 12px;min-height:0;
+  font-size:.79rem;font-weight:560;
+}}
+/* Keep the film noir wallpaper visible to the right and below the tiles. */
+.metro-layout.showing-overview {{background:linear-gradient(90deg,rgba(10,27,42,.18),rgba(10,27,42,.06) 68%,transparent 100%)}}
+@media(max-width:1540px) {{
+ .metro-layout.showing-overview .metro-featured {{grid-template-columns:repeat(8,minmax(0,1fr));max-width:1250px}}
+ .metro-layout.showing-overview .metro-metrics {{max-width:1000px}}
+}}
+@media(max-width:1240px) {{
+ .metro-layout.showing-overview .metro-featured {{grid-template-columns:repeat(6,minmax(0,1fr));max-width:1000px}}
+ .metro-layout.showing-overview .metro-metrics {{max-width:850px}}
+}}
+@media(max-width:930px) {{
+ .metro-layout.showing-overview .metro-content {{padding:18px 19px 55px}}
+ .metro-layout.showing-overview .metro-featured {{grid-template-columns:repeat(4,minmax(0,1fr));max-width:640px;gap:9px}}
+}}
+@media(max-width:580px) {{
+ .metro-layout.showing-overview .metro-content {{padding:14px 12px 42px}}
+ .metro-layout.showing-overview .metro-featured {{grid-template-columns:repeat(2,minmax(0,1fr));max-width:420px}}
+ .metro-layout.showing-overview .metro-metrics {{grid-template-columns:repeat(3,minmax(0,1fr))}}
+}}
+
+/* Expanding text only affects the card whose button was pressed. */
+.metro-library-section .card .localized-plot:not(.expanded) {{
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:5;
+  line-clamp:5;
+  overflow:hidden;
+}}
+.metro-library-section .card .plot-more {{
+  border:0;
+  background:none;
+  color:#a4dfed;
+  padding:0;
+  margin:0 0 6px;
+  font-size:.76rem;
+  text-align:left;
+  align-self:flex-start;
+  min-height:22px;
+}}
+.metro-library-section .card .plot-more:hover {{background:none;text-decoration:underline;color:#fff}}
+
+@media(prefers-reduced-motion:reduce){{html{{scroll-behavior:auto}}}}
+
+
+/* Short, non-blocking visual feedback before first large library layout. */
+.library-loading {{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;background:rgba(9,22,34,.88);backdrop-filter:blur(3px);}}
+.library-loading[hidden] {{display:none !important}}
+.library-loading-panel {{display:flex;flex-direction:column;align-items:center;gap:15px;padding:28px 42px;background:rgba(27,44,62,.96);border:1px solid #56758e;box-shadow:0 14px 52px rgba(0,0,0,.32);color:#e5f4ff;font-weight:600;letter-spacing:.03em}}
+.library-loading-detail {{font-size:.82rem;max-width:330px;text-align:center;color:#a8c9db;font-weight:400;line-height:1.5}}
+.library-spinner {{width:41px;height:41px;border:4px solid rgba(126,199,229,.2);border-top-color:#81c9e8;border-radius:50%;animation:library-spin .85s linear infinite}}
+@keyframes library-spin {{to {{transform:rotate(360deg)}}}}
+@media (prefers-reduced-motion:reduce) {{.library-spinner {{animation:none;border-top-color:#81c9e8}}}}
 </style>
 </head>
 <body>
 <header>
   <div class="header-main">
     <div class="brand-row">
-      <h1><span data-i18n="catalogTitle">Medienkatalog</span> · <span id="visibleCount">{len(rows)}</span> <span data-i18n="titles">Titel</span></h1>
+      <div class="metro-logo" aria-hidden="true"><svg width="51" height="51" viewBox="0 0 54 54" xmlns="http://www.w3.org/2000/svg"><path fill="#b061e4" d="M4 8v38h9V24l14 12v-13Z"/><path fill="#6382ec" d="M27 23v13l14-12v22h9V8Z"/><path fill="#54bbdf" d="M27 23 50 8v11L27 36Z"/><path fill="#9268da" d="M4 8 27 23l-9 8L4 19Z"/></svg></div>
+      <div class="metro-brand-text"><h1><span class="brand-title" data-i18n="catalogTitle">MNEMOSYNE</span></h1><div class="metro-brand-subtitle" data-i18n="brandSubtitle">FILM- UND SERIENBIBLIOTHEK</div></div>
       <span class="server-health" id="serverHealth" title="{html.escape(server_host or configured_source_summary(args), quote=True)}">
         <span id="serverLed" class="server-led {'online' if server_online else 'offline'}" aria-hidden="true"></span>
         <span data-i18n="filmServer">Filmserver</span>: <strong id="serverStatusText" data-server-state="{'online' if server_online else 'offline'}">{'online' if server_online else 'offline'}</strong>
@@ -4169,7 +4636,32 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
     </div>
   </div>
 
-  <div class="search-row">
+</header>
+<div class="metro-layout">
+  <aside class="metro-sidebar" aria-label="Bibliotheks-Navigation">
+    <button class="metro-nav-btn active" type="button" data-metro-view="overview" onclick="setMetroView('overview')"><span class="metro-nav-icon">⌂</span><span data-i18n="navOverview">Übersicht</span></button>
+    <button class="metro-nav-btn" type="button" data-metro-view="movies" onclick="setMetroView('movies')"><span class="metro-nav-icon">▤</span><span data-i18n="navMovies">Filme</span></button>
+    <button class="metro-nav-btn" type="button" data-metro-view="series" onclick="setMetroView('series')"><span class="metro-nav-icon">▣</span><span data-i18n="navSeries">Serien</span></button>
+    <button class="metro-nav-btn" type="button" data-metro-view="favorites" onclick="setMetroView('favorites')"><span class="metro-nav-icon">☆</span><span data-i18n="navFavorites">Favoriten</span></button>
+    <button class="metro-nav-btn" type="button" data-metro-view="history" onclick="setMetroView('history')"><span class="metro-nav-icon">◷</span><span data-i18n="navHistory">Verlauf</span></button>
+    <div class="metro-sidebar-footer"><strong>MNEMOSYNE</strong><span>v4.15.29</span><span class="metro-author-line">Johannes Wronka<br>ChatGPT (OpenAI)</span></div>
+  </aside>
+  <div class="metro-content">
+    <section class="metro-overview" id="metroOverview" aria-label="Bibliotheksübersicht">
+      <div class="metro-metrics">
+        <button type="button" class="metric-tile metric-movies" onclick="setMetroView('movies')"><span class="metric-icon">▤</span><span class="metric-number">{movie_count}</span><span class="metric-label" data-i18n="navMovies">Filme</span></button>
+        <button type="button" class="metric-tile metric-series" onclick="setMetroView('series')"><span class="metric-icon">▣</span><span class="metric-number">{series_count}</span><span class="metric-label" data-i18n="navSeries">Serien</span></button>
+        <div class="metric-tile metric-all" role="group"><span class="metric-icon">▱</span><span class="metric-number">{len(rows)}</span><span class="metric-label" data-i18n="metricTotal">Titel gesamt</span></div>
+      </div>
+      <div class="metro-section-title"><h2 data-i18n="featuredRecent">Zuletzt hinzugefügt</h2><span class="metro-count" aria-label="20 neueste Titel">{len(by_date)} <span data-i18n="titles">Titel</span></span></div>
+      <div class="metro-featured" id="metroFeatured">{''.join(featured_html) if featured_html else '<div class="metro-no-featured" data-i18n="noFeatured">Noch keine Datumsangaben vorhanden.</div>'}</div>
+    </section>
+    <div id="libraryLoading" class="library-loading" role="status" aria-live="polite" aria-label="Bibliothek wird geladen">
+      <div class="library-loading-panel"><span class="library-spinner" aria-hidden="true"></span><span id="libraryLoadingText">Bibliothek wird vorbereitet …</span><span id="libraryLoadingDetail" class="library-loading-detail">Bitte einen Moment – Filme und Serien werden vorbereitet.</span></div>
+    </div>
+    <section class="metro-library-section" id="metroLibrary" hidden>
+    <div class="metro-library-heading"><h2 id="metroSectionName" data-i18n="libraryHeading">Alle Titel</h2><span class="metro-count" id="visibleCount">{len(rows)}</span></div>
+    <div class="search-row">
     <input class="main-search" id="search" type="search" placeholder="Titel, Jahr, Genre, Regisseur oder Schauspieler filtern …" data-i18n-placeholder="searchPlaceholder" oninput="filterCards()">
     <input class="filename-search" id="filenameSearch" type="search" placeholder="Dateiname enthält …" data-i18n-placeholder="filenamePlaceholder" oninput="filterCards()" aria-label="Dateinamen filtern">
     <button id="filterToggle" class="filter-toggle" type="button" onclick="toggleFilterPanel()" aria-expanded="false">
@@ -4212,13 +4704,16 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
   <div class="meta">
     <span><span data-i18n="source">Quellen</span>: <span id="sourceSummary">{source}</span> · <span data-i18n="lastScan">letzter Scan</span>: {last_scan}{omdb_state} · <span data-i18n="serverDates">Serverdaten</span>: {html.escape(meta.get("server_date_count", "0"))}/{len(rows)}</span>
   </div>
-</header>
 <main>
-{notice_html}{error_html}
+{browser_warning_html}{notice_html}{error_html}
 <div class="grid" id="grid">{''.join(cards)}</div>
+<div id="alphabetJumpTail" class="alphabet-jump-tail" aria-hidden="true"></div>
 <div class="empty" id="empty" style="display:none" data-i18n="noMatches">Keine passenden Titel.</div>
 </main>
-<nav id="alphabetNav" class="alphabet-nav" aria-label="A–Z navigation">
+    </section>
+  </div>
+</div>
+<nav id="alphabetNav" class="alphabet-nav" hidden aria-label="A–Z navigation">
   {''.join(f'<button type="button" data-letter="{letter}" onclick="jumpToLetter(\'{letter}\')">{letter}</button>' for letter in ['#'] + list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'))}
 </nav>
 <dialog id="randomDialog" class="random-dialog">
@@ -4274,7 +4769,7 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
         <label for="cfgLinuxSeriesPath" data-i18n="cfgLinuxSeriesPath">Linux: Pfad Serien</label>
         <input id="cfgLinuxSeriesPath" type="text" spellcheck="false">
       </div>
-      <p class="config-note" data-i18n="configNote">Änderungen werden in config.txt neben dem Python-Skript gespeichert. Neue Pfade gelten beim nächsten Bibliotheks-Scan.</p>
+      <p class="config-note" data-i18n="configNote">Änderungen werden in data/config.txt gespeichert. Neue Pfade gelten beim nächsten Bibliotheks-Scan.</p>
       <div class="config-actions">
         <span id="configStatus" class="config-status" aria-live="polite"></span>
         <button class="config-close" type="button" onclick="closeConfigDialog()" data-i18n="cancel">Abbrechen</button>
@@ -4286,11 +4781,178 @@ dialog.random-dialog::backdrop {{ background:rgba(0,0,0,.68); }}
 <script>
 const VIEW_STATE_KEY = 'medienkatalog-view-v1';
 const LANGUAGE_KEY = 'medienkatalog-language-session-v1';
+const METRO_FAV_KEY = 'mnemosyne-metro-favs-v1';
+const METRO_HISTORY_KEY = 'mnemosyne-metro-play-v1';
+let activeMetroView = 'overview';
+let metroRecentSort = false;
+function readMetroList(key) {{
+  try {{ const list = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(list) ? list.map(String) : []; }}
+  catch (_) {{ return []; }}
+}}
+let metroFavorites = new Set(readMetroList(METRO_FAV_KEY));
+let metroHistory = readMetroList(METRO_HISTORY_KEY);
+function saveMetroList(key, list) {{ try {{ localStorage.setItem(key, JSON.stringify(list)); }} catch (_) {{}} }}
+function updateFavoriteButtons() {{
+  document.querySelectorAll('.favorite-btn').forEach(button => {{
+    const id = String(button.closest('.card').dataset.mediaId);
+    const favored = metroFavorites.has(id);
+    button.classList.toggle('active', favored);
+    button.textContent = favored ? '★' : '☆';
+    button.setAttribute('aria-pressed', favored ? 'true' : 'false');
+  }});
+}}
+function toggleFavorite(id) {{
+  id = String(id);
+  if (metroFavorites.has(id)) metroFavorites.delete(id); else metroFavorites.add(id);
+  saveMetroList(METRO_FAV_KEY, [...metroFavorites]);
+  updateFavoriteButtons();
+  if (activeMetroView === 'favorites') filterCards();
+}}
+function rememberPlayed(id) {{
+  id = String(id);
+  metroHistory = [id, ...metroHistory.filter(x => x !== id)].slice(0, 100);
+  saveMetroList(METRO_HISTORY_KEY, metroHistory);
+}}
+function updateMetroNavigation() {{
+  document.querySelectorAll('[data-metro-view]').forEach(button => {{
+    const selected = button.dataset.metroView === activeMetroView;
+    button.classList.toggle('active', selected);
+    button.setAttribute('aria-current', selected ? 'page' : 'false');
+  }});
+  const layout = document.querySelector('.metro-layout');
+  if (layout) layout.classList.toggle('showing-overview', activeMetroView === 'overview');
+  const overview = document.getElementById('metroOverview');
+  if (overview) overview.hidden = activeMetroView !== 'overview';
+  const library = document.getElementById('metroLibrary');
+  if (library) library.hidden = activeMetroView === 'overview';
+  const az = document.getElementById('alphabetNav');
+  if (az) az.hidden = activeMetroView === 'overview';
+  const sectionName = document.getElementById('metroSectionName');
+  const nameKey = {{overview:'featuredRecent',movies:'navMovies',series:'navSeries',favorites:'navFavorites',history:'navHistory'}}[activeMetroView];
+  if (sectionName) sectionName.textContent = t(nameKey || 'libraryHeading');
+}}
+function clearCatalogFilters() {{
+  document.getElementById('search').value = '';
+  document.getElementById('filenameSearch').value = '';
+  document.getElementById('catalogFilter').value = 'all';
+  document.getElementById('genreFilter').value = '';
+  document.getElementById('directorFilter').value = '';
+  document.getElementById('actorFilter').value = '';
+  document.getElementById('recentFilter').value = '';
+  toggleFilterPanel(false);
+}}
+// Keep the startup overlay visible until Chromium has actually completed
+// the first library layouts. Loading a tab must never dismiss it prematurely.
+let libraryBooting = true;
+let libraryLoadGeneration = 0;
+function libraryLoadingVisible(show, view, detail) {{
+  const overlay = document.getElementById('libraryLoading');
+  if (!overlay) return;
+  if (show) {{
+    const label = document.getElementById('libraryLoadingText');
+    const sub = document.getElementById('libraryLoadingDetail');
+    const names = {{movies:t('navMovies'),series:t('navSeries')}};
+    if (label) label.textContent = view === 'startup'
+      ? (activeLanguage === 'en' ? 'Preparing media library …' : activeLanguage === 'es' ? 'Preparando biblioteca …' : 'Medienbibliothek wird vorbereitet …')
+      : (activeLanguage === 'en' ? 'Loading ' : activeLanguage === 'es' ? 'Cargando ' : 'Lade ') + (names[view] || t('libraryHeading')) + ' …';
+    if (sub && detail) sub.textContent = detail;
+  }}
+  overlay.hidden = !show;
+}}
+function browserPaint() {{
+  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}}
+function shortYield() {{return new Promise(resolve => setTimeout(resolve, 70));}}
+async function prepareLibraryOnStartup() {{
+  // Render and lay out each catalog section BEFORE making the dashboard usable.
+  // This work is deliberately scheduled across different tasks so the progress
+  // text can be painted, rather than appearing and disappearing in one frame.
+  libraryLoadingVisible(true, 'startup');
+  try {{
+    await browserPaint();
+    await shortYield();
+    const grid = document.getElementById('grid');
+    const library = document.getElementById('metroLibrary');
+    const overview = document.getElementById('metroOverview');
+    for (const [view, label] of [
+      ['movies', [ 'Filme werden vorbereitet …','Preparing movies …','Preparando películas …']],
+      ['series', [ 'Serien werden vorbereitet …','Preparing series …','Preparando series …']]
+    ]) {{
+      document.getElementById('libraryLoadingText').textContent = label[['de','en','es'].indexOf(activeLanguage)];
+      const detail = document.getElementById('libraryLoadingDetail');
+      if (detail) detail.textContent = activeLanguage === 'en'
+        ? 'The catalog is being organized. The overview will unlock automatically.'
+        : activeLanguage === 'es'
+          ? 'Se está organizando el catálogo. La vista se desbloqueará automáticamente.'
+          : 'Die Einträge werden vorbereitet. Die Übersicht wird anschließend freigegeben.';
+      await browserPaint();
+      await shortYield();
+      activeMetroView = view;
+      updateMetroNavigation();
+      filterCards();
+      // Force a genuine layout pass while the library is visible behind overlay.
+      if (grid) void grid.getBoundingClientRect().height;
+      await browserPaint();
+      await shortYield();
+    }}
+    // Restore the dashboard without triggering another large filter operation.
+    activeMetroView = 'overview';
+    updateMetroNavigation();
+    if (overview) void overview.offsetHeight;
+    await browserPaint();
+    // Allow any queued image/layout work for the initial visible viewport to settle.
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await browserPaint();
+  }} catch (error) {{
+    console.error('Mnemosyne: preparation failed:', error);
+    const detail = document.getElementById('libraryLoadingDetail');
+    if (detail) detail.textContent = 'Vorbereitung unvollständig – die Bibliothek kann dennoch verwendet werden.';
+  }} finally {{
+    libraryBooting = false;
+    // Existing view restoration (e.g. after a scan) happens only after warm-up.
+    try {{restoreViewState();}} catch (error) {{console.error('View restoration:', error);}}
+    await browserPaint();
+    libraryLoadingVisible(false);
+  }}
+}}
+function setMetroView(view) {{
+  if (libraryBooting) return;
+  if (!['overview', 'movies', 'series', 'favorites', 'history'].includes(view)) return;
+  ++libraryLoadGeneration;
+  if (view !== activeMetroView) clearCatalogFilters();
+  activeMetroView = view;
+  metroRecentSort = false;
+  updateMetroNavigation();
+  filterCards();
+  if (view === 'overview') {{
+    window.scrollTo({{top:0,behavior:'smooth'}});
+  }} else {{
+    const heading = document.querySelector('.metro-library-heading');
+    if (heading) heading.scrollIntoView({{behavior:'instant',block:'start'}});
+  }}
+}}
+function showFeatured(id) {{
+  const card = document.getElementById('media-' + id);
+  if (!card) return;
+  const view = card.dataset.kind === 'series' ? 'series' : 'movies';
+  setMetroView(view);
+  function scrollWhenReady() {{
+    if (activeMetroView !== view) return;
+    card.scrollIntoView({{behavior:'smooth',block:'start'}});
+  }}
+  requestAnimationFrame(scrollWhenReady);
+}}
+function updateFeaturedLanguage() {{
+  document.querySelectorAll('.featured-title').forEach(item => {{
+    const key = activeLanguage === 'es' ? 'titleEs' : (activeLanguage === 'en' ? 'titleEn' : 'titleDe');
+    item.textContent = item.dataset[key] || item.dataset.titleEn || '';
+  }});
+}}
 const CONFIG_STARTUP_LANGUAGE = {json.dumps(str(getattr(args, 'startup_language', 'de')) if str(getattr(args, 'startup_language', 'de')) in {'de','en','es'} else 'de')};
 let activeLanguage = CONFIG_STARTUP_LANGUAGE;
 const I18N = {{
   de: {{
-    pageTitle:'Medienkatalog', catalogTitle:'Medienkatalog', titles:'Titel', filters:'Filter',
+    pageTitle:'Mnemosyne', catalogTitle:'MNEMOSYNE', titles:'Titel', filters:'Filter', brandSubtitle:'FILM- UND SERIENBIBLIOTHEK', navOverview:'Übersicht', navMovies:'Filme', navSeries:'Serien', navFavorites:'Favoriten', navHistory:'Verlauf', metricTotal:'Titel gesamt', featuredRecent:'Zuletzt hinzugefügt', showAllRecent:'Alle anzeigen ↗', noFeatured:'Noch keine Datumsangaben vorhanden.', libraryHeading:'Alle Titel', plotMore:'Mehr anzeigen', plotLess:'Weniger anzeigen',
     searchPlaceholder:'Titel, Jahr, Genre, Regisseur oder Schauspieler filtern …',
     filenamePlaceholder:'Dateiname enthält …',
     allTitles:'Alle Titel', moviesOnly:'Nur Filme', seriesOnly:'Nur Serien', kidsAll:'Kinder: alle',
@@ -4298,7 +4960,7 @@ const I18N = {{
     allGenres:'Alle Genres', allDirectors:'Alle Regisseure', allActors:'Alle Schauspieler',
     allAddedDates:'Alle Speicherzeiten', last7Days:'Zuletzt hinzugefügt: 7 Tage', last30Days:'Zuletzt hinzugefügt: 30 Tage',
     last90Days:'Zuletzt hinzugefügt: 90 Tage', last365Days:'Zuletzt hinzugefügt: 1 Jahr', addedLabel:'Auf Server',
-    resetFilters:'Zurücksetzen', refreshLibrary:'Bibliothek aktualisieren', settings:'Einstellungen', settingsTitle:'Konfiguration', cfgApiKey:'OMDb API-Key', cfgMaxRequests:'Max. Requests pro Tag', cfgStartupLanguage:'Startsprache', cfgScanStartup:'Scan beim Start', cfgWindowsMoviesPath:'Windows: Pfad Filme', cfgWindowsSeriesPath:'Windows: Pfad Serien', cfgLinuxMoviesPath:'Linux: Pfad Filme', cfgLinuxSeriesPath:'Linux: Pfad Serien', configNote:'Das Betriebssystem wird automatisch erkannt. Unter Linux kann direkt smb:// verwendet werden; ein /mnt-Mount ist nicht erforderlich. Neue Pfade gelten beim nächsten Bibliotheks-Scan.', saveConfig:'Speichern', savingConfig:'Speichere …', configSaved:'Konfiguration gespeichert.', configLoadFailed:'Konfiguration konnte nicht geladen werden.', configSaveFailed:'Konfiguration konnte nicht gespeichert werden.', cancel:'Abbrechen', yes:'Ja', no:'Nein', exportPdf:'PDF-Liste erstellen', pdfCreating:'PDF wird erstellt …', pdfFailed:'PDF konnte nicht erstellt werden.', noPdfTitles:'Keine sichtbaren Titel für den PDF-Export.', source:'Quelle',
+    resetFilters:'Zurücksetzen', refreshLibrary:'Bibliothek aktualisieren', settings:'Einstellungen', settingsTitle:'Konfiguration', cfgApiKey:'OMDb API-Key', cfgMaxRequests:'Max. Requests pro Tag', cfgStartupLanguage:'Startsprache', cfgScanStartup:'Scan beim Start', cfgWindowsMoviesPath:'Windows: Pfad Filme', cfgWindowsSeriesPath:'Windows: Pfad Serien', cfgLinuxMoviesPath:'Linux: Pfad Filme', cfgLinuxSeriesPath:'Linux: Pfad Serien', configNote:'Das Betriebssystem wird automatisch erkannt. Unter Linux kann direkt smb:// verwendet werden; ein /mnt-Mount ist nicht erforderlich. Neue Pfade gelten beim nächsten Bibliotheks-Scan.', saveConfig:'Speichern', savingConfig:'Speichere …', configSaved:'Konfiguration gespeichert.', configLoadFailed:'Konfiguration konnte nicht geladen werden.', configSaveFailed:'Konfiguration konnte nicht gespeichert werden.', cancel:'Abbrechen', yes:'Ja', no:'Nein', exportPdf:'PDF-Liste erstellen', pdfCreating:'PDF wird erstellt …', pdfFailed:'PDF konnte nicht erstellt werden.', noPdfTitles:'Keine Titel für den PDF-Export vorhanden.', source:'Quelle',
     lastScan:'letzter Scan', serverDates:'Serverdaten', calls:'Aufrufe', fromDb:'aus DB', omdbNotice:'OMDb-Hinweis',
     todayUsage:'heute lokal gezählt', remainingApprox:'ca. verbleibend', filmServer:'Filmserver', online:'online', offline:'offline', checking:'prüfe …',
     noMatches:'Keine passenden Titel.', noCover:'Kein Cover', openIMDb:'IMDb öffnen', searchTrailer:'Trailer suchen',
@@ -4313,10 +4975,10 @@ const I18N = {{
     scanFailed:'Bibliothek konnte nicht aktualisiert werden.', starting:'Öffne …', started:'Geöffnet',
     playFailed:'Medienaktion konnte nicht ausgeführt werden.', randomMovie:'Zufälliger Film',
     randomMovieTitle:'Dein Zufallsfilm', anotherRandom:'Noch einen', close:'Schließen', noMovies:'Keine Filme in der Bibliothek gefunden.',
-    germanTitlePlaceholder:'Deutscher Titel', saveGermanTitle:'Deutschen Titel speichern', resetGermanTitle:'Deutschen Titel zurücksetzen'
+    windowMinimize:'Fenster minimieren', windowClose:'Mnemosyne schließen', germanTitlePlaceholder:'Deutscher Titel', saveGermanTitle:'Deutschen Titel speichern', resetGermanTitle:'Deutschen Titel zurücksetzen', browserFallbackTitle:'Browser-Hinweis:', browserFallbackText:'Der optimierte Browsermodus ist nicht verfügbar. Mnemosyne läuft im Standardbrowser; installierte Erweiterungen können die Oberfläche verlangsamen. Installiere Chromium, Chrome, Edge oder Brave für den isolierten Modus.'
   }},
   en: {{
-    pageTitle:'Media Library', catalogTitle:'Media Library', titles:'titles', filters:'Filters',
+    pageTitle:'Mnemosyne', catalogTitle:'MNEMOSYNE', titles:'titles', filters:'Filters', brandSubtitle:'MOVIE & SERIES LIBRARY', navOverview:'Overview', navMovies:'Movies', navSeries:'Series', navFavorites:'Favorites', navHistory:'History', metricTotal:'Total titles', featuredRecent:'Recently added', showAllRecent:'Show all ↗', noFeatured:'No dates available yet.', libraryHeading:'All titles', plotMore:'Read more', plotLess:'Show less',
     searchPlaceholder:'Filter by title, year, genre, director or actor …',
     filenamePlaceholder:'Filename contains …',
     allTitles:'All titles', moviesOnly:'Movies only', seriesOnly:'Series only', kidsAll:'Kids: all',
@@ -4324,7 +4986,7 @@ const I18N = {{
     allGenres:'All genres', allDirectors:'All directors', allActors:'All actors',
     allAddedDates:'All added dates', last7Days:'Added in last 7 days', last30Days:'Added in last 30 days',
     last90Days:'Added in last 90 days', last365Days:'Added in last year', addedLabel:'On server',
-    resetFilters:'Reset', refreshLibrary:'Update library', settings:'Settings', settingsTitle:'Configuration', cfgApiKey:'OMDb API key', cfgMaxRequests:'Max. requests per day', cfgStartupLanguage:'Startup language', cfgScanStartup:'Scan on startup', cfgWindowsMoviesPath:'Windows: movies path', cfgWindowsSeriesPath:'Windows: series path', cfgLinuxMoviesPath:'Linux: movies path', cfgLinuxSeriesPath:'Linux: series path', configNote:'The operating system is detected automatically. Linux can use smb:// directly; no /mnt mount is required. New paths apply to the next library scan.', saveConfig:'Save', savingConfig:'Saving …', configSaved:'Configuration saved.', configLoadFailed:'Configuration could not be loaded.', configSaveFailed:'Configuration could not be saved.', cancel:'Cancel', yes:'Yes', no:'No', exportPdf:'Create PDF list', pdfCreating:'Creating PDF …', pdfFailed:'PDF could not be created.', noPdfTitles:'No visible titles to export to PDF.', source:'Source',
+    resetFilters:'Reset', refreshLibrary:'Update library', settings:'Settings', settingsTitle:'Configuration', cfgApiKey:'OMDb API key', cfgMaxRequests:'Max. requests per day', cfgStartupLanguage:'Startup language', cfgScanStartup:'Scan on startup', cfgWindowsMoviesPath:'Windows: movies path', cfgWindowsSeriesPath:'Windows: series path', cfgLinuxMoviesPath:'Linux: movies path', cfgLinuxSeriesPath:'Linux: series path', configNote:'The operating system is detected automatically. Linux can use smb:// directly; no /mnt mount is required. New paths apply to the next library scan.', saveConfig:'Save', savingConfig:'Saving …', configSaved:'Configuration saved.', configLoadFailed:'Configuration could not be loaded.', configSaveFailed:'Configuration could not be saved.', cancel:'Cancel', yes:'Yes', no:'No', exportPdf:'Create PDF list', pdfCreating:'Creating PDF …', pdfFailed:'PDF could not be created.', noPdfTitles:'No titles available for PDF export.', source:'Source',
     lastScan:'last scan', serverDates:'server dates', calls:'requests', fromDb:'from DB', omdbNotice:'OMDb notice',
     todayUsage:'locally counted today', remainingApprox:'approx. remaining', filmServer:'Movie server', online:'online', offline:'offline', checking:'checking …',
     noMatches:'No matching titles.', noCover:'No cover', openIMDb:'Open IMDb', searchTrailer:'Search trailer',
@@ -4339,10 +5001,10 @@ const I18N = {{
     scanFailed:'Library could not be updated.', starting:'Opening …', started:'Opened',
     playFailed:'Media action could not be completed.', randomMovie:'Random movie',
     randomMovieTitle:'Your random movie', anotherRandom:'Another one', close:'Close', noMovies:'No movies found in the library.',
-    germanTitlePlaceholder:'German title', saveGermanTitle:'Save German title', resetGermanTitle:'Reset German title'
+    windowMinimize:'Minimize window', windowClose:'Close Mnemosyne', germanTitlePlaceholder:'German title', saveGermanTitle:'Save German title', resetGermanTitle:'Reset German title', browserFallbackTitle:'Browser notice:', browserFallbackText:'The optimized browser mode is unavailable. Mnemosyne is running in your default browser; installed extensions may slow the interface down. Install Chromium, Chrome, Edge or Brave for isolated mode.'
   }},
   es: {{
-    pageTitle:'Catálogo multimedia', catalogTitle:'Catálogo multimedia', titles:'títulos', filters:'Filtros',
+    pageTitle:'Mnemosyne', catalogTitle:'MNEMOSYNE', titles:'títulos', filters:'Filtros', brandSubtitle:'BIBLIOTECA DE CINE Y SERIES', navOverview:'Inicio', navMovies:'Películas', navSeries:'Series', navFavorites:'Favoritos', navHistory:'Historial', metricTotal:'Títulos en total', featuredRecent:'Añadidos recientemente', showAllRecent:'Ver todos ↗', noFeatured:'Todavía no hay fechas disponibles.', libraryHeading:'Todos los títulos', plotMore:'Leer más', plotLess:'Mostrar menos',
     searchPlaceholder:'Filtrar por título, año, género, director o actor …',
     filenamePlaceholder:'El nombre de archivo contiene …',
     allTitles:'Todos los títulos', moviesOnly:'Solo películas', seriesOnly:'Solo series', kidsAll:'Infantil: todo',
@@ -4350,7 +5012,7 @@ const I18N = {{
     allGenres:'Todos los géneros', allDirectors:'Todos los directores', allActors:'Todos los actores',
     allAddedDates:'Todas las fechas', last7Days:'Añadidos en los últimos 7 días', last30Days:'Añadidos en los últimos 30 días',
     last90Days:'Añadidos en los últimos 90 días', last365Days:'Añadidos en el último año', addedLabel:'En el servidor',
-    resetFilters:'Restablecer', refreshLibrary:'Actualizar biblioteca', settings:'Ajustes', settingsTitle:'Configuración', cfgApiKey:'Clave API de OMDb', cfgMaxRequests:'Máx. solicitudes por día', cfgStartupLanguage:'Idioma inicial', cfgScanStartup:'Escanear al iniciar', cfgWindowsMoviesPath:'Windows: ruta de películas', cfgWindowsSeriesPath:'Windows: ruta de series', cfgLinuxMoviesPath:'Linux: ruta de películas', cfgLinuxSeriesPath:'Linux: ruta de series', configNote:'El sistema operativo se detecta automáticamente. Linux puede usar smb:// directamente; no se requiere un montaje /mnt. Las nuevas rutas se aplican en el próximo escaneo.', saveConfig:'Guardar', savingConfig:'Guardando …', configSaved:'Configuración guardada.', configLoadFailed:'No se pudo cargar la configuración.', configSaveFailed:'No se pudo guardar la configuración.', cancel:'Cancelar', yes:'Sí', no:'No', exportPdf:'Crear lista PDF', pdfCreating:'Creando PDF …', pdfFailed:'No se pudo crear el PDF.', noPdfTitles:'No hay títulos visibles para exportar a PDF.', source:'Fuente',
+    resetFilters:'Restablecer', refreshLibrary:'Actualizar biblioteca', settings:'Ajustes', settingsTitle:'Configuración', cfgApiKey:'Clave API de OMDb', cfgMaxRequests:'Máx. solicitudes por día', cfgStartupLanguage:'Idioma inicial', cfgScanStartup:'Escanear al iniciar', cfgWindowsMoviesPath:'Windows: ruta de películas', cfgWindowsSeriesPath:'Windows: ruta de series', cfgLinuxMoviesPath:'Linux: ruta de películas', cfgLinuxSeriesPath:'Linux: ruta de series', configNote:'El sistema operativo se detecta automáticamente. Linux puede usar smb:// directamente; no se requiere un montaje /mnt. Las nuevas rutas se aplican en el próximo escaneo.', saveConfig:'Guardar', savingConfig:'Guardando …', configSaved:'Configuración guardada.', configLoadFailed:'No se pudo cargar la configuración.', configSaveFailed:'No se pudo guardar la configuración.', cancel:'Cancelar', yes:'Sí', no:'No', exportPdf:'Crear lista PDF', pdfCreating:'Creando PDF …', pdfFailed:'No se pudo crear el PDF.', noPdfTitles:'No hay títulos disponibles para exportar a PDF.', source:'Fuente',
     lastScan:'último escaneo', serverDates:'fechas del servidor', calls:'solicitudes', fromDb:'de la BD', omdbNotice:'Aviso de OMDb',
     todayUsage:'contado localmente hoy', remainingApprox:'aprox. restantes', filmServer:'Servidor multimedia', online:'en línea', offline:'sin conexión', checking:'comprobando …',
     noMatches:'No hay títulos coincidentes.', noCover:'Sin carátula', openIMDb:'Abrir IMDb', searchTrailer:'Buscar tráiler',
@@ -4365,7 +5027,7 @@ const I18N = {{
     scanFailed:'No se pudo actualizar la biblioteca.', starting:'Abriendo …', started:'Abierto',
     playFailed:'No se pudo completar la acción multimedia.', randomMovie:'Película aleatoria',
     randomMovieTitle:'Tu película aleatoria', anotherRandom:'Otra', close:'Cerrar', noMovies:'No se encontraron películas en la biblioteca.',
-    germanTitlePlaceholder:'Título alemán', saveGermanTitle:'Guardar título alemán', resetGermanTitle:'Restablecer título alemán'
+    windowMinimize:'Minimizar ventana', windowClose:'Cerrar Mnemosyne', germanTitlePlaceholder:'Título alemán', saveGermanTitle:'Guardar título alemán', resetGermanTitle:'Restablecer título alemán', browserFallbackTitle:'Aviso del navegador:', browserFallbackText:'El modo de navegador optimizado no está disponible. Mnemosyne se ejecuta en el navegador predeterminado; las extensiones instaladas pueden ralentizar la interfaz. Instala Chromium, Chrome, Edge o Brave para usar el modo aislado.'
   }}
 }};
 const GENRE_DE = {{
@@ -4400,6 +5062,16 @@ const STATUS_I18N = {{
   es: {{ 'manual':'Manual', 'gefunden':'encontrado', 'nicht zugeordnet':'sin asignar', 'metadaten deaktiviert':'metadatos desactivados', 'manuell zugeordnet':'Manual' }}
 }};
 
+function togglePlot(button) {{
+  const plot = button.previousElementSibling;
+  if (!plot || !plot.classList.contains('localized-plot')) return;
+  const expanded = plot.classList.toggle('expanded');
+  button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  const key = expanded ? 'plotLess' : 'plotMore';
+  button.dataset.i18n = key;
+  button.textContent = t(key);
+}}
+
 function t(key) {{
   return (I18N[activeLanguage] && I18N[activeLanguage][key]) || I18N.de[key] || key;
 }}
@@ -4415,6 +5087,14 @@ function applyLanguage(language) {{
   document.querySelectorAll('[data-i18n-placeholder]').forEach(element => {{
     const key = element.dataset.i18nPlaceholder;
     if (key) element.setAttribute('placeholder', t(key));
+  }});
+  document.querySelectorAll('[data-i18n-title]').forEach(element => {{
+    const key = element.dataset.i18nTitle;
+    if (key) element.setAttribute('title', t(key));
+  }});
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(element => {{
+    const key = element.dataset.i18nAriaLabel;
+    if (key) element.setAttribute('aria-label', t(key));
   }});
   document.querySelectorAll('[data-kind-code]').forEach(element => {{
     element.textContent = element.dataset.kindCode === 'series'
@@ -4456,6 +5136,8 @@ function applyLanguage(language) {{
   }});
   const languageSelect = document.getElementById('languageSelect');
   if (languageSelect) languageSelect.value = activeLanguage;
+  updateFeaturedLanguage();
+  updateMetroNavigation();
   updateServerStatusLabel();
   try {{ sessionStorage.setItem(LANGUAGE_KEY, activeLanguage); }} catch (_) {{}}
   if (document.getElementById('grid')) filterCards();
@@ -4521,19 +5203,29 @@ function updateFilterSummary() {{
   }}
 }}
 
+function localizedSortTitle(card) {{
+  const field = activeLanguage === 'es' ? 'titleEs' : (activeLanguage === 'en' ? 'titleEn' : 'titleDe');
+  return (card.dataset[field] || card.dataset.titleEn || card.dataset.title || '').trim();
+}}
+
 function titleInitial(card) {{
-  let title = (card.dataset.title || '').trim();
+  let title = localizedSortTitle(card);
   if (!title) return '#';
-  // Treat German/European accented initials naturally: Ä→A, Ö→O, Ü→U, É→E.
   let first = title.charAt(0);
   try {{ first = first.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }} catch (_) {{}}
   first = first.toUpperCase();
   return /^[A-Z]$/.test(first) ? first : '#';
 }}
 
+function resetAlphabetJumpTail() {{
+  const tail = document.getElementById('alphabetJumpTail');
+  if (tail) tail.style.height = '0px';
+}}
+
 function updateAlphabetNav() {{
+  if (activeMetroView === 'overview') return;
   const available = new Set();
-  document.querySelectorAll('.card').forEach(card => {{
+  document.querySelectorAll('#grid .card').forEach(card => {{
     if (card.style.display !== 'none') available.add(titleInitial(card));
   }});
   document.querySelectorAll('#alphabetNav button[data-letter]').forEach(button => {{
@@ -4541,18 +5233,49 @@ function updateAlphabetNav() {{
   }});
 }}
 
+let alphabetJumpSerial = 0;
 function jumpToLetter(letter) {{
-  const target = Array.from(document.querySelectorAll('.card')).find(card =>
+  // Search in the ACTUAL visible order and current GUI language, not the OMDb title.
+  const target = Array.from(document.querySelectorAll('#grid .card')).find(card =>
     card.style.display !== 'none' && titleInitial(card) === letter
   );
   if (!target) return;
-  document.querySelectorAll('.card.letter-jump').forEach(card => card.classList.remove('letter-jump'));
+  const serial = ++alphabetJumpSerial;
+  resetAlphabetJumpTail();
+  const tail = document.getElementById('alphabetJumpTail');
+  const header = document.querySelector('header');
+  const headerGap = (header ? header.getBoundingClientRect().height : 0) + 14;
+  document.querySelectorAll('#grid .card.letter-jump').forEach(card => card.classList.remove('letter-jump'));
   target.classList.add('letter-jump');
-  target.scrollIntoView({{behavior:'smooth', block:'start'}});
-  window.setTimeout(() => target.classList.remove('letter-jump'), 1200);
+
+  function alignLetter() {{
+    if (serial !== alphabetJumpSerial || target.style.display === 'none') return;
+    const desiredY = window.scrollY + target.getBoundingClientRect().top - headerGap;
+    const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    // Without extra scroll room the last rows (especially Z) can never reach the top.
+    if (tail && desiredY > maxY) {{
+      const previous = parseFloat(tail.style.height || '0') || 0;
+      tail.style.height = Math.ceil(previous + desiredY - maxY + 20) + 'px';
+    }}
+    window.scrollTo({{top:Math.max(0, desiredY), behavior:'instant'}});
+  }}
+  alignLetter();
+  // content-visibility:auto may refine dimensions while Chromium scrolls across
+  // hundreds of cards. Correct the scroll again once those dimensions settle.
+  requestAnimationFrame(() => requestAnimationFrame(alignLetter));
+  window.setTimeout(alignLetter, 180);
+  window.setTimeout(alignLetter, 500);
+  window.setTimeout(() => {{ if (serial === alphabetJumpSerial) target.classList.remove('letter-jump'); }}, 1600);
 }}
 
 function filterCards() {{
+  ++alphabetJumpSerial;
+  resetAlphabetJumpTail();
+  if (activeMetroView === 'overview') {{
+    updateMetroNavigation();
+    updateFilterSummary();
+    return;
+  }}
   const q = document.getElementById('search').value.trim().toLocaleLowerCase();
   const filenameQuery = document.getElementById('filenameSearch').value.trim().toLocaleLowerCase();
   const filter = document.getElementById('catalogFilter').value;
@@ -4608,22 +5331,34 @@ function filterCards() {{
       const addedTs = Number(card.dataset.addedTs || '0');
       recentMatch = addedTs > 0 && addedTs >= recentCutoff;
     }}
-    const show = searchMatch && filenameMatch && filterMatch && genreMatch && directorMatch && actorMatch && recentMatch;
+    const id = String(card.dataset.mediaId);
+    const metroMatch = (activeMetroView === 'movies' && card.dataset.kind === 'movie') ||
+      (activeMetroView === 'series' && card.dataset.kind === 'series') ||
+      (activeMetroView === 'favorites' && metroFavorites.has(id)) ||
+      (activeMetroView === 'history' && metroHistory.includes(id));
+    const show = metroMatch && searchMatch && filenameMatch && filterMatch && genreMatch && directorMatch && actorMatch && recentMatch;
     card.style.display = show ? '' : 'none';
     if (show) visible++;
   }});
   const grid = document.getElementById('grid');
-  const cards = Array.from(grid.querySelectorAll('.card'));
-  cards.sort((a, b) => {{
-    if (recentDays > 0) {{
+  const oldOrder = Array.from(grid.children);
+  const sortedCards = oldOrder.slice().sort((a, b) => {{
+    if (recentDays > 0 || metroRecentSort) {{
       const byDate = Number(b.dataset.addedTs || '0') - Number(a.dataset.addedTs || '0');
       if (byDate !== 0) return byDate;
     }}
     const kindOrderA = a.dataset.kind === 'series' ? 1 : 0;
     const kindOrderB = b.dataset.kind === 'series' ? 1 : 0;
     if (kindOrderA !== kindOrderB) return kindOrderA - kindOrderB;
-    return (a.dataset.title || '').localeCompare((b.dataset.title || ''), activeLanguage === 'de' ? 'de' : (activeLanguage === 'es' ? 'es' : 'en'), {{sensitivity:'base'}});
-  }}).forEach(card => grid.appendChild(card));
+    return localizedSortTitle(a).localeCompare(localizedSortTitle(b), activeLanguage === 'de' ? 'de' : (activeLanguage === 'es' ? 'es' : 'en'), {{sensitivity:'base'}});
+  }});
+  // Avoid detaching/reinserting all cards on every keystroke. 708 items
+  // stay in place if the language/date ordering has not actually changed.
+  if (sortedCards.some((card, index) => card !== oldOrder[index])) {{
+    const fragment = document.createDocumentFragment();
+    sortedCards.forEach(card => fragment.appendChild(card));
+    grid.appendChild(fragment);
+  }}
   document.getElementById('empty').style.display = visible ? 'none' : 'block';
   document.getElementById('visibleCount').textContent = String(visible);
   updateFilterSummary();
@@ -4631,21 +5366,17 @@ function filterCards() {{
 }}
 
 function resetFilters() {{
-  document.getElementById('search').value = '';
-  document.getElementById('filenameSearch').value = '';
-  document.getElementById('catalogFilter').value = 'all';
-  document.getElementById('genreFilter').value = '';
-  document.getElementById('directorFilter').value = '';
-  document.getElementById('actorFilter').value = '';
-  document.getElementById('recentFilter').value = '';
-  sessionStorage.removeItem(VIEW_STATE_KEY);
+  clearCatalogFilters();
+  metroRecentSort = false;
+  updateMetroNavigation();
+  try {{ sessionStorage.removeItem(VIEW_STATE_KEY); }} catch (_) {{}}
   filterCards();
-  toggleFilterPanel(false);
 }}
 
 async function exportPdf(button) {{
-  const ids = Array.from(document.querySelectorAll('.card'))
-    .filter(card => card.style.display !== 'none')
+  // Export the complete catalog, not just the featured overview or visible filters.
+  // All full catalog cards exist in the DOM even when the library section is hidden.
+  const ids = Array.from(document.querySelectorAll('#grid .card'))
     .map(card => Number(card.dataset.mediaId || '0'))
     .filter(id => Number.isInteger(id) && id > 0);
   if (!ids.length) {{
@@ -4669,7 +5400,7 @@ async function exportPdf(button) {{
       throw new Error(message || t('pdfFailed'));
     }}
     const blob = await response.blob();
-    let filename = 'Medienkatalog.pdf';
+    let filename = 'Mnemosyne.pdf';
     const disposition = response.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename="?([^";]+)"?/i);
     if (match && match[1]) filename = match[1];
@@ -4737,12 +5468,14 @@ function saveViewState(form) {{
     actor: document.getElementById('actorFilter').value,
     recent: document.getElementById('recentFilter').value,
     filterPanelOpen: !document.getElementById('filterPanel').hidden,
+    metroView: activeMetroView,
+    recentSort: metroRecentSort,
     scrollY: window.scrollY,
     anchorId: card ? card.id : '',
     anchorTop: card ? card.getBoundingClientRect().top : 0,
     openDetails: openDetails
   }};
-  sessionStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state));
+  try {{ sessionStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state)); }} catch (_) {{}}
 }}
 
 async function refreshLibrary(event, form) {{
@@ -4758,7 +5491,7 @@ async function refreshLibrary(event, form) {{
   try {{
     const response = await fetch('/scan', {{
       method: 'POST',
-      headers: {{ 'X-Requested-With': 'MedienKatalog' }},
+      headers: {{ 'X-Requested-With': 'Mnemosyne' }},
       cache: 'no-store'
     }});
     const result = await response.json().catch(() => ({{}}));
@@ -4776,9 +5509,10 @@ async function refreshLibrary(event, form) {{
 }}
 
 function restoreViewState() {{
-  const raw = sessionStorage.getItem(VIEW_STATE_KEY);
+  let raw = null;
+  try {{ raw = sessionStorage.getItem(VIEW_STATE_KEY); }} catch (_) {{}}
   if (!raw) {{ filterCards(); return; }}
-  sessionStorage.removeItem(VIEW_STATE_KEY);
+  try {{ sessionStorage.removeItem(VIEW_STATE_KEY); }} catch (_) {{}}
   try {{
     const state = JSON.parse(raw);
     if (typeof state.search === 'string') document.getElementById('search').value = state.search;
@@ -4788,6 +5522,9 @@ function restoreViewState() {{
     if (typeof state.director === 'string') document.getElementById('directorFilter').value = state.director;
     if (typeof state.actor === 'string') document.getElementById('actorFilter').value = state.actor;
     if (typeof state.recent === 'string') document.getElementById('recentFilter').value = state.recent;
+    if (typeof state.metroView === 'string' && ['overview','movies','series','favorites','history'].includes(state.metroView)) activeMetroView = state.metroView;
+    metroRecentSort = Boolean(state.recentSort);
+    updateMetroNavigation();
     filterCards();
     const hasAdvancedFilter = document.getElementById('catalogFilter').value !== 'all' || Boolean(document.getElementById('genreFilter').value) || Boolean(document.getElementById('directorFilter').value) || Boolean(document.getElementById('actorFilter').value) || Boolean(document.getElementById('recentFilter').value);
     toggleFilterPanel(typeof state.filterPanelOpen === 'boolean' ? state.filterPanelOpen : hasAdvancedFilter);
@@ -4828,7 +5565,7 @@ function showRandomMovie() {{
     alert(t('noMovies'));
     return;
   }}
-  let candidates = allMovies.filter(card => card.style.display !== 'none');
+  let candidates = activeMetroView === 'overview' ? allMovies : allMovies.filter(card => card.style.display !== 'none');
   if (!candidates.length) candidates = allMovies;
   const card = candidates[Math.floor(Math.random() * candidates.length)];
   const mediaId = Number(card.dataset.mediaId || '0');
@@ -4996,6 +5733,7 @@ async function startMedia(mediaId, button, kind) {{
       throw new Error(message || t('playFailed'));
     }}
     button.textContent = t('started');
+    rememberPlayed(mediaId);
     window.setTimeout(() => {{ button.textContent = t(kind === 'series' ? 'openFolder' : 'playFilm'); button.disabled = false; }}, 1200);
   }} catch (error) {{
     button.textContent = originalText;
@@ -5087,7 +5825,10 @@ async function saveConfig(event) {{
   let savedLanguage = 'de';
   try {{ savedLanguage = sessionStorage.getItem(LANGUAGE_KEY) || CONFIG_STARTUP_LANGUAGE; }} catch (_) {{ savedLanguage = CONFIG_STARTUP_LANGUAGE; }}
   applyLanguage(savedLanguage);
-  restoreViewState();
+  updateFavoriteButtons();
+  // The startup overlay is already visible in HTML, before JS begins work.
+  // Schedule prewarming after the first paint, not in the page-load task.
+  setTimeout(prepareLibraryOnStartup, 100);
   refreshServerStatus();
   window.setInterval(refreshServerStatus, 15000);
 }})();
@@ -5097,7 +5838,7 @@ async function saveConfig(event) {{
 
 
 class CatalogWebHandler(BaseHTTPRequestHandler):
-    server_version = "MedienKatalog/4.15.7"
+    server_version = "Mnemosyne/4.15.29"
 
     def _send_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
@@ -5135,7 +5876,7 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _send_download(self, payload: bytes, content_type: str, filename: str) -> None:
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._") or "Medienkatalog.pdf"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._") or "Mnemosyne.pdf"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -5177,6 +5918,14 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path in ("/favicon.ico", "/mnemosyne_icon.png"):
+            icon_name = "mnemosyne_icon.ico" if path == "/favicon.ico" else "mnemosyne_icon.png"
+            icon_path = packaged_resource_directory() / icon_name
+            try:
+                self._send_binary(icon_path.read_bytes(), "image/x-icon" if path.endswith(".ico") else "image/png")
+            except OSError:
+                self.send_error(404, "Mnemosyne icon not found")
+            return
         if path == "/config-data":
             cfg = load_app_config()
             self._send_json({
@@ -5279,7 +6028,7 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                 language = str(data.get("language", "de")); language = language if language in {"de", "en", "es"} else "de"
                 payload = generate_catalog_pdf(self.app.args, ids, language=language)
                 stamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H%M")
-                self._send_download(payload, "application/pdf", f"Medienkatalog_{stamp}.pdf")
+                self._send_download(payload, "application/pdf", f"Mnemosyne_{stamp}.pdf")
                 return
 
             match = re.fullmatch(r"/play-media/(\d+)", path)
@@ -5289,7 +6038,7 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/scan":
-                ajax_scan = self.headers.get("X-Requested-With") == "MedienKatalog"
+                ajax_scan = self.headers.get("X-Requested-With") == "Mnemosyne"
                 if not self.app.scan_lock.acquire(blocking=False):
                     if ajax_scan:
                         self._send_json({"ok": False, "error": "Ein Scan läuft bereits."}, 409)
@@ -5388,7 +6137,7 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, 400)
             elif path.startswith("/play-media/") or path == "/export-pdf":
                 self._send_text(str(exc), 400)
-            elif path == "/scan" and self.headers.get("X-Requested-With") == "MedienKatalog":
+            elif path == "/scan" and self.headers.get("X-Requested-With") == "Mnemosyne":
                 self._send_json({"ok": False, "error": str(exc)}, 400)
             else:
                 self._send_html(render_web_catalog(self.app.args, error=str(exc)), 400)
@@ -5435,7 +6184,7 @@ def choose_startup_scan() -> bool | None:
             except tk.TclError:
                 pass
             answer = messagebox.askyesnocancel(
-                "Medienkatalog",
+                "Mnemosyne",
                 "Soll die Bibliothek vor dem Öffnen aktualisiert werden?\n\n"
                 "Ja = Netzlaufwerk scannen und Datenbank aktualisieren\n"
                 "Nein = vorhandene Datenbank sofort öffnen\n"
@@ -5464,6 +6213,236 @@ def choose_startup_scan() -> bool | None:
     return False
 
 
+
+def _is_snap_chromium(executable: str) -> bool:
+    """Recognize Ubuntu/Kubuntu's confined Snap Chromium launcher."""
+    name = str(executable).replace("\\", "/")
+    if name.startswith("/snap/bin/chromium"):
+        return True
+    if os.name == "nt":
+        return False
+    path = Path(executable)
+    try:
+        # /usr/bin/chromium-browser is sometimes just a Snap forwarding wrapper.
+        if path.is_symlink() and "/snap/bin/chromium" in str(path.readlink()):
+            return True
+        if path.is_file() and path.stat().st_size < 16384:
+            header = path.read_bytes()[:8192].decode("utf-8", "ignore").lower()
+            if ("snap run chromium" in header or "/snap/bin/chromium" in header
+                    or "exec snap" in header and "chromium" in header):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _mnemosyne_browser_profile_dir(port: int, executable: str = "") -> Path:
+    """Use a writable path for Snap; keep all other profiles isolated as before."""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        profile = base / "Mnemosyne" / "BrowserProfile" / str(port)
+    elif _is_snap_chromium(executable):
+        # Strict Snap Chromium cannot write to ~/.cache/mnemosyne (hidden dir).
+        # ~/snap/chromium/common is its allowed persistent user-data location.
+        profile = Path.home() / "snap" / "chromium" / "common" / "mnemosyne-browser" / str(port)
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+        profile = base / "mnemosyne" / "browser-profile" / str(port)
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def _find_isolated_browsers() -> list[tuple[str, str]]:
+    """Return every available browser in preferred order; a broken one can be skipped."""
+    candidates: list[tuple[str, str]] = []
+    custom = os.environ.get("MNEMOSYNE_BROWSER", "").strip()
+    if custom:
+        resolved = shutil.which(custom) or (custom if Path(custom).is_file() else None)
+        if resolved:
+            candidates.append(("Eigener Browser", resolved))
+        else:
+            print(f"Hinweis: MNEMOSYNE_BROWSER nicht gefunden: {custom}", file=sys.stderr)
+    if os.name == "nt":
+        program_files = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        explicit = [
+            ("Microsoft Edge", "Microsoft/Edge/Application/msedge.exe"),
+            ("Google Chrome", "Google/Chrome/Application/chrome.exe"),
+            ("Chromium", "Chromium/Application/chrome.exe"),
+            ("Brave", "BraveSoftware/Brave-Browser/Application/brave.exe"),
+        ]
+        for root in program_files:
+            if not root:
+                continue
+            for label, relative in explicit:
+                path = Path(root) / Path(relative)
+                if path.is_file():
+                    candidates.append((label, str(path)))
+        path_names = [
+            ("Microsoft Edge", "msedge"),
+            ("Google Chrome", "chrome"),
+            ("Chromium", "chromium"),
+            ("Brave", "brave"),
+        ]
+    else:
+        path_names = [
+            ("Chromium", "chromium"),
+            ("Chromium", "chromium-browser"),
+            ("Google Chrome", "google-chrome-stable"),
+            ("Google Chrome", "google-chrome"),
+            ("Microsoft Edge", "microsoft-edge-stable"),
+            ("Microsoft Edge", "microsoft-edge"),
+            ("Brave", "brave-browser"),
+            ("Brave", "brave-browser-stable"),
+        ]
+    for label, executable in path_names:
+        resolved = shutil.which(executable)
+        if resolved:
+            candidates.append((label, resolved))
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for label, executable in candidates:
+        key = os.path.normcase(os.path.abspath(executable))
+        if key not in seen:
+            seen.add(key)
+            result.append((label, executable))
+    return result
+
+
+def _find_isolated_browser() -> tuple[str, str] | None:
+    """Compatibility wrapper used by older tools/tests."""
+    browsers = _find_isolated_browsers()
+    return browsers[0] if browsers else None
+
+
+def _mnemosyne_browser_log() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "Mnemosyne"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "mnemosyne"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base = Path(tempfile.gettempdir())
+    return base / "browser-start.log"
+
+
+def _linux_profile_browser_alive(profile: Path) -> bool:
+    """Snap wrappers can exit 0 after spawning Chromium: look for its live child."""
+    if not sys.platform.startswith("linux"):
+        return False
+    marker = f"--user-data-dir={profile}".encode("utf-8")
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit() or int(name) == os.getpid():
+                continue
+            try:
+                cmd = (Path("/proc") / name / "cmdline").read_bytes()
+                if marker in cmd and (b"chrom" in cmd.lower() or b"brave" in cmd.lower()):
+                    return True
+            except (OSError, PermissionError):
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _browser_log_tail(path: Path) -> str:
+    try:
+        lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        return " | ".join(lines[-5:])[-550:]
+    except OSError:
+        return ""
+
+
+
+
+def _launch_isolated_browser(browser: tuple[str, str], url: str, port: int) -> subprocess.Popen[Any]:
+    """Start a browser, check early failure and preserve diagnostics.
+
+    A spawned process is NOT proof a window appeared. Any immediate failure
+    triggers another browser candidate or a visible default-browser fallback.
+    """
+    label, executable = browser
+    profile_dir = _mnemosyne_browser_profile_dir(port, executable)
+    command = [
+        executable,
+        f"--user-data-dir={profile_dir}",
+        "--disable-extensions",
+        "--disable-sync",
+        "--no-first-run",
+        "--no-default-browser-check",
+        # Native browser title bar controls minimize, maximize and close.
+        "--start-maximized",
+        f"--app={url}",
+    ]
+    if sys.platform.startswith("linux"):
+        # Let KDE associate our Chromium app window with mnemosyne.desktop.
+        command.insert(-1, "--class=Mnemosyne")
+    log_path = _mnemosyne_browser_log()
+    kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    try:
+        with log_path.open("ab") as log:
+            log.write((f"\n[{datetime.now().isoformat(timespec='seconds')}] "
+                       f"{label}: {executable} | profile={profile_dir} | url={url}\n").encode())
+            log.flush()
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        try:
+            code = process.wait(timeout=2.8)
+        except subprocess.TimeoutExpired:
+            # Normal Chromium keeps a process alive while the app window runs.
+            return process
+        if code == 0:
+            # A snap/desktop wrapper may detach; only accept this when its
+            # actual Chromium child can be found under our unique profile.
+            if os.name == "nt":
+                return process
+            for _ in range(5):
+                if _linux_profile_browser_alive(profile_dir):
+                    return process
+                time.sleep(0.25)
+        detail = _browser_log_tail(log_path)
+        raise RuntimeError(
+            f"{label} wurde sofort beendet (Exit-Code {code}). "
+            + (f"Ausgabe: {detail}. " if detail else "")
+            + f"Log: {log_path}"
+        )
+    except OSError as exc:
+        raise RuntimeError(f"{label}: {exc} (Log: {log_path})") from exc
+
+
+def _watch_mnemosyne_window(
+    server: ThreadingHTTPServer, browser: tuple[str, str], process: subprocess.Popen[Any], port: int
+) -> None:
+    """Stop this Mnemosyne web server after its isolated browser window is closed.
+
+    Chromium's Snap launcher may exit immediately while its child continues,
+    so watch the browser child via its dedicated user-data-dir on Linux.
+    """
+    try:
+        profile_dir = _mnemosyne_browser_profile_dir(port, browser[1])
+        if process.poll() is None:
+            process.wait()
+        if sys.platform.startswith("linux"):
+            # The Snap launcher may have detached a child: continue tracking it.
+            while _linux_profile_browser_alive(profile_dir):
+                time.sleep(2.0)
+        # Give browser processes a moment to detach before treating exit as close.
+        if process.returncode is not None:
+            time.sleep(1.5)
+            if sys.platform.startswith("linux") and _linux_profile_browser_alive(profile_dir):
+                while _linux_profile_browser_alive(profile_dir):
+                    time.sleep(2.0)
+        server.shutdown()
+    except Exception as exc:
+        print(f"Mnemosyne: Browser-Abschlussüberwachung: {exc}", file=sys.stderr)
+
+
 def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str) -> int:
     # Datenbank schon vor dem ersten HTTP-Aufruf initialisieren.
     connection = open_database(args.db)
@@ -5483,7 +6462,7 @@ def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str
         args.port = int(server.server_address[1])
         print(
             f"Hinweis: Port {requested_port} ist bereits belegt; "
-            f"Medienkatalog verwendet automatisch Port {args.port}.",
+            f"Mnemosyne verwendet automatisch Port {args.port}.",
             file=sys.stderr,
         )
     server.app = context  # type: ignore[attr-defined]
@@ -5504,21 +6483,60 @@ def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str
 
     shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     catalog_url = f"http://{shown_host}:{args.port}/"
-    print(f"Medienkatalog läuft unter {catalog_url}")
+    print(f"Mnemosyne läuft unter {catalog_url}")
     print("Beenden mit Strg+C.")
 
-    # Beim Desktop-Start wird der Standardbrowser plattformneutral geöffnet.
-    # Der kleine Timer verhindert, dass der erste Aufruf vor dem Serverstart erfolgt.
+    # Mnemosyne bevorzugt einen isolierten Chromium-Familienbrowser. Das separate
+    # Profil enthält keine Erweiterungen des normalen Benutzerprofils; zusätzlich
+    # werden Extensions explizit deaktiviert. Ist kein passender Browser vorhanden,
+    # fällt Mnemosyne auf den Standardbrowser zurück und zeigt dort einen Hinweis.
+    args.browser_fallback = False
+    browser_candidates = _find_isolated_browsers() if not args.kein_browser else []
+    if not args.kein_browser and not browser_candidates:
+        args.browser_fallback = True
+        print(
+            "Hinweis: Kein Chromium-/Chrome-/Edge-/Brave-Browser für den isolierten "
+            "Mnemosyne-Modus gefunden. Der Standardbrowser wird verwendet; Browser-Erweiterungen "
+            "können die Oberfläche verlangsamen.",
+            file=sys.stderr,
+        )
+
     if not args.kein_browser:
         def open_catalog_in_browser() -> None:
+            for browser in browser_candidates:
+                try:
+                    browser_process = _launch_isolated_browser(browser, catalog_url, args.port)
+                    context.browser_profile = _mnemosyne_browser_profile_dir(args.port, browser[1])
+                    context.browser_url = catalog_url
+                    context.browser_process = browser_process
+                    # The normal double-click launcher hides the terminal, so
+                    # background server instances must not accumulate after closing.
+                    threading.Thread(
+                        target=_watch_mnemosyne_window,
+                        args=(server, browser, browser_process, args.port),
+                        daemon=True, name="MnemosyneBrowserLifetime"
+                    ).start()
+                    if not args.ruhig:
+                        print(
+                            f"Mnemosyne: Browserprozess in {browser[0]} gestartet "
+                            "(separates Profil, Erweiterungen deaktiviert).",
+                            file=sys.stderr,
+                        )
+                    return
+                except Exception as exc:
+                    print(f"Warnung: Isolierter Start von {browser[0]} fehlgeschlagen: {exc}", file=sys.stderr)
+            args.browser_fallback = True
+            print(
+                "Mnemosyne-Hinweis: Kein optimierter Browser konnte gestartet werden. "
+                f"Standardbrowser wird geöffnet: {catalog_url}",
+                file=sys.stderr,
+            )
             try:
-                if os.name == "nt" and hasattr(os, "startfile"):
-                    os.startfile(catalog_url)  # type: ignore[attr-defined]
-                else:
-                    webbrowser.open(catalog_url, new=2)
+                if not webbrowser.open(catalog_url, new=2):
+                    print(f"Bitte manuell im Browser öffnen: {catalog_url}", file=sys.stderr)
             except Exception as exc:
-                if not args.ruhig:
-                    print(f"Warnung: Browser konnte nicht automatisch geöffnet werden: {exc}", file=sys.stderr)
+                print(f"Warnung: Browser konnte nicht automatisch geöffnet werden: {exc}. "
+                      f"Bitte manuell öffnen: {catalog_url}", file=sys.stderr)
 
         timer = threading.Timer(0.4, open_catalog_in_browser)
         timer.daemon = True
@@ -5552,7 +6570,7 @@ def parse_args(argv: Sequence[str] | None = None, *, app_config: dict[str, Any] 
               Rekursiv ausgewertet werden nur die Bereiche Filme und Serien.
 
             Konfiguration:
-              config.txt neben dem Skript: API-Key, Max-Requests, Startup-Language,
+              data/config.txt neben dem Programm: API-Key, Max-Requests, Startup-Language,
               Scan-On-Startup sowie getrennte Windows-/Linux-Medienpfade.
 
             Umgebungsvariablen:
@@ -5659,6 +6677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Ein Doppelklick/Launcher-Aufruf ohne Argumente startet unter Windows und
     # Desktop-Linux automatisch die Weboberfläche. CLI-Aufrufe
     # mit Optionen behalten weiterhin ihr bisheriges Verhalten.
+    migrate_legacy_data()
     app_config = load_app_config()
     global OMDB_DAILY_LIMIT
     OMDB_DAILY_LIMIT = int(app_config.get("Max-Requests") or 100000)

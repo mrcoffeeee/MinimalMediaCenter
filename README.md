@@ -1,10 +1,10 @@
-# Minimal Media Center
+# Mnemosyne
 
-A lightweight local movie and TV series catalog written in Python. Its vibecoded with ChatGPT Pro so if you´re not a fan of this feel free to ignore. To all others: It is very basic but its fast. Sometimes thats better than an overloadedmedia center ...
+A lightweight, local movie and TV-series catalog for **Windows and Linux**. Mnemosyne started as a small, collaboratively developed Python project by **Johannes Wronka and ChatGPT (OpenAI)**. It prioritizes a focused, responsive media library instead of an overloaded media-center suite.
 
-Minimal Media Center scans movie and series folders recursively, enriches detected titles with metadata from [OMDb](https://www.omdbapi.com/), stores the results in a local SQLite database, and presents the library in a browser-based interface with covers, ratings, filters, PDF export, and manual IMDb assignment.
+Mnemosyne scans movie and series folders recursively, enriches titles using [OMDb](https://www.omdbapi.com/), and stores the results in SQLite. Its Chromium-based desktop interface provides posters, ratings, search, filters, playback links, manual IMDb assignment, and complete-library PDF export.
 
-The application is designed for desktop use on **Windows** and **Linux** and works well with local folders, mapped network drives, mounted network shares, or SMB sources.
+**Current documented version: 4.15.29.** Portable releases are available as a Linux AppImage or Windows executable (built on the corresponding operating system). The source Python script remains available for development.
 
 ---
 
@@ -45,12 +45,16 @@ Metadata is loaded through the OMDb API and stored locally:
 - Responsive movie/series cards
 - Poster display with local cover cache
 - Automatic poster fallback through IMDb when possible
-- German and English GUI
-- Optional custom background image
+- German, English, and Spanish GUI
+- Bundled default background image and the colorful M application icon
 - Movie server online/offline LED
 - Current result counter
 - Configuration editor directly in the web interface
 - Filters remain active after library updates or metadata changes
+- Metro-style sidebar with Overview, Movies, Series, Favorites, and History
+- Overview shows library totals and 20 recently added titles
+- First-launch preparation screen prevents the interface from appearing unresponsive while the catalog is rendered
+- Native browser title bar handles minimizing, maximizing, and closing
 
 ### Filters and search
 
@@ -117,27 +121,11 @@ If filters are currently active, the random selection prefers movies matching th
 
 ### PDF export
 
-The currently visible library can be exported to an A4 PDF.
+**Create PDF list** exports the **complete library of movies and series**, regardless of the currently selected page or active search filters. It no longer exports only the 20 titles on the Overview page.
 
-The PDF includes:
+The A4 PDF contains posters, titles, release years, IMDb ratings with graphical bars, genres, runtimes, age ratings, directors, cast, and plot descriptions. IMDb `tt...` identifiers are deliberately not printed.
 
-- Movie/series poster
-- Title and year
-- IMDb rating with graphical rating bar
-- Genre
-- Runtime
-- Age rating
-- Director
-- Cast
-- Plot
-
-The IMDb `tt...` identifier is intentionally not printed in the PDF.
-
-Active filters are respected, so you can for example export only:
-
-```text
-Movies + Action + last 90 days
-```
+PDF creation requires `reportlab` when running from Python source; the portable build packages its Python dependencies.
 
 ### Local caching
 
@@ -153,52 +141,58 @@ Already known titles normally do **not** cause new OMDb requests during a regula
 
 ## Requirements
 
-### Python
+### Portable AppImage / Windows EXE
 
-Python **3.10 or newer** is recommended.
+- **No separate Python installation required** on the computer running a built portable release.
+- An installed Chromium-based browser (Chromium or Chrome) is still required for the interface.
+- Local media folders, mounted drives, and supported SMB paths must be accessible with suitable permissions.
+- The application folder and its `data/` subfolder must be writable if the library is to be updated.
 
-Most of the application only uses the Python standard library.
+### Running from source
 
-### Required for PDF export
+- Python 3.10 or newer is recommended.
+- Install `reportlab` for PDF generation: `python -m pip install reportlab`.
+- Install `smbprotocol` if direct `smb://` access is required: `python -m pip install smbprotocol`.
+- A Chromium-based browser is recommended for the desktop-app window.
 
-```bash
-pip install reportlab
-```
+### Building portable releases
 
-### Optional: direct `smb://` access
+Build on the **target operating system** using the matching builder:
 
-If the media paths are configured as direct SMB URLs, install:
+- Linux: `Mnemosyne_AppImage_erstellen.py` (PyInstaller and `appimagetool`).
+- Windows: `Mnemosyne_Windows_EXE_erstellen.py` (PyInstaller).
 
-```bash
-pip install smbprotocol
-```
-
-If Windows already provides the share as a UNC path or drive letter, or Linux mounts the share into the local filesystem, `smbprotocol` is not required.
+The builders set up a separate build environment; internet access is normally required to obtain dependencies and build tools. Building is not necessary when you already have a ready-to-run AppImage or EXE.
 
 ---
 
-## Installation
+## Portable installation and directory layout
 
-Clone or download the project and keep the files together in one directory:
-
-```text
-MediaCatalog/
-├── medien_katalog_web.py
-├── config.txt
-├── Medienkatalog_Start.cmd
-└── Medienkatalog_Start.sh
-```
-
-The application creates additional files automatically:
+There is **no application installer** for the portable distributions. Keep the executable and persistent data together:
 
 ```text
-MediaCatalog/
-├── medien_katalog.sqlite3
-├── cover_cache/
-└── background.jpg        # optional
+Mnemosyne/
+├── Mnemosyne_4.15.29-x86_64.AppImage   # Linux
+├── Mnemosyne_4.15.29.exe               # Windows (optional in the same folder)
+└── data/
+    ├── config.txt
+    ├── medien_katalog.sqlite3
+    └── cover_cache/
 ```
 
-The OMDb metadata cache is stored in the normal per-user cache directory.
+The **M icon and standard background are embedded** in the portable binaries; separate icon/background files are needed only as build inputs, not for normal use.
+
+Mnemosyne reads and updates its database, settings, and poster cache under the `data/` folder **beside the executable**, not in the temporary PyInstaller/AppImage extraction directory. Both portable builds can share this folder if the media locations are configured for each operating system.
+
+### Migrating from older versions
+
+Version 4.15.29 includes a non-destructive one-time migration. If `config.txt`, `medien_katalog.sqlite3`, or `cover_cache/` still live in the main Mnemosyne folder, the missing counterparts are copied into `data/` on startup.
+
+Files already in `data/` are **not overwritten**. The original legacy files remain in place until you have checked the new version. Close all old instances before upgrading, and make a backup of the SQLite database.
+
+### Updating
+
+Replace the old AppImage/EXE with a newer build; keep the existing `data/` directory. No rescan or database reset is required solely because the executable has changed, provided the new version remains compatible with the saved database schema.
 
 ---
 
@@ -223,12 +217,13 @@ Series-Path=\\192.168.1.100\Media\Series
 |---|---|
 | `API-Key` | Your OMDb API key |
 | `Max-Requests` | Daily OMDb request limit of your subscription |
-| `Startup-Language` | `de` for German or `en` for English |
+| `Startup-Language` | `de` for German, `en` for English, or `es` for Spanish |
 | `Scan-On-Startup` | `Yes` to scan at startup, `No` to open the existing database immediately |
-| `Movies-Path` | Root directory containing movies |
-| `Series-Path` | Root directory containing TV series |
+| `Movies-Path` / `Series-Path` | Legacy media paths (still read for compatibility) |
+| `Windows-Movies-Path` / `Windows-Series-Path` | Windows media locations |
+| `Linux-Movies-Path` / `Linux-Series-Path` | Linux media locations (`/mnt/...` or `smb://...`) |
 
-The same values can be edited from **Settings** in the web interface.
+All current settings can be edited from **Settings** in the web interface. Mnemosyne selects the platform-specific paths automatically, so a single `config.txt` can describe both Linux and Windows media locations.
 
 ### Windows path examples
 
@@ -327,71 +322,58 @@ Individual episodes are never intended to appear as separate catalog titles.
 
 ## Starting the application
 
-### Windows
+### Linux (AppImage)
 
-Double-click:
-
-```text
-Medienkatalog_Start.cmd
+```bash
+chmod +x Mnemosyne_4.15.29-x86_64.AppImage
+./Mnemosyne_4.15.29-x86_64.AppImage
 ```
 
-or run:
+The AppImage can also be launched by double-clicking when the file manager allows executable files. It is not installed system-wide.
+
+### Windows (portable EXE)
+
+Double-click `Mnemosyne_4.15.29.exe`. There is no installer. The executable uses the `data/` folder alongside itself.
+
+### From Python source
+
+```bash
+python3 mnemosyne_web_v4_15_29.py  # Linux
+```
 
 ```powershell
-python medien_katalog_web.py
+py mnemosyne_web_v4_15_29.py       # Windows
 ```
 
-With no command-line arguments, the application automatically starts the web interface and opens the default browser.
+Older versioned `.sh` and `.bat` launchers can still be used with their matching `.py` versions. The default local address is `http://127.0.0.1:8090/`; Mnemosyne binds to localhost by default.
 
-### Linux
+### Creating portable builds
 
-Make the launcher executable once:
+Copy the appropriate builder into the Mnemosyne source folder alongside the newest `mnemosyne_web_v*.py` and the build assets (`mnemosyne_icon.png`, `mnemosyne_icon.ico`, and the background image).
+
+On **Linux**:
 
 ```bash
-chmod +x Medienkatalog_Start.sh
+python3 Mnemosyne_AppImage_erstellen.py
 ```
 
-Then run:
+The builder puts its temporary build environment under the Linux home cache to avoid problems with mounted NTFS/exFAT drives; the resulting AppImage is copied back into the Mnemosyne folder.
 
-```bash
-./Medienkatalog_Start.sh
+On **Windows**:
+
+```powershell
+py Mnemosyne_Windows_EXE_erstellen.py
 ```
 
-or:
-
-```bash
-python3 medien_katalog_web.py
-```
-
-On desktop Linux, the default browser is opened automatically.
-
-### Default web address
-
-```text
-http://127.0.0.1:8090/
-```
-
-The application listens only on localhost by default.
+Build each binary on its target operating system; a Linux PyInstaller build is not a native Windows EXE.
 
 ---
 
-## Background image
+## Background image and application icon
 
-To use a custom background, place one of these files next to the Python script:
+The default background and the colorful Mnemosyne **M** icon are **embedded in the portable AppImage/EXE**. They are served from packaged resources, not read from `data/` at runtime.
 
-```text
-background.jpg
-```
-
-or:
-
-```text
-background.png
-```
-
-The image is detected automatically.
-
-Remove the file to return to the default dark background.
+For development and when building a new release, keep the original image files alongside the source script. The AppImage builder expects the background as `background.png`, `background.jpg`, or `background.jpeg`. Changing these bundled assets requires rebuilding the portable application; merely replacing an image beside the AppImage will not change the embedded default.
 
 ---
 
@@ -411,7 +393,7 @@ This is only a connectivity indicator; it does not guarantee that every individu
 
 ## OMDb request counter
 
-Minimal Media Center keeps a local count of the OMDb requests made by this application.
+Mnemosyne keeps a local count of the OMDb requests made by this application.
 
 The configured daily maximum comes from:
 
@@ -489,13 +471,13 @@ Samples, trailers, extras, featurettes, deleted scenes, and several common auxil
 Start the web interface explicitly:
 
 ```bash
-python medien_katalog_web.py --web
+python mnemosyne_web_v4_15_29.py --web
 ```
 
 Use different media paths without changing `config.txt`:
 
 ```bash
-python medien_katalog_web.py \
+python mnemosyne_web_v4_15_29.py \
   --filme-pfad "/mnt/media/movies" \
   --serien-pfad "/mnt/media/series" \
   --web
@@ -504,37 +486,37 @@ python medien_katalog_web.py \
 Scan without requesting OMDb metadata:
 
 ```bash
-python medien_katalog_web.py --ohne-metadaten --pfade
+python mnemosyne_web_v4_15_29.py --ohne-metadaten --pfade
 ```
 
 Export a console scan to CSV:
 
 ```bash
-python medien_katalog_web.py --csv catalog.csv
+python mnemosyne_web_v4_15_29.py --csv catalog.csv
 ```
 
 Export to JSON:
 
 ```bash
-python medien_katalog_web.py --json catalog.json
+python mnemosyne_web_v4_15_29.py --json catalog.json
 ```
 
 Use another web port:
 
 ```bash
-python medien_katalog_web.py --web --port 8080
+python mnemosyne_web_v4_15_29.py --web --port 8080
 ```
 
 Do not open the browser automatically:
 
 ```bash
-python medien_katalog_web.py --web --kein-browser
+python mnemosyne_web_v4_15_29.py --web --kein-browser
 ```
 
 Skip the initial scan for this run:
 
 ```bash
-python medien_katalog_web.py --web --kein-startscan
+python mnemosyne_web_v4_15_29.py --web --kein-startscan
 ```
 
 ---
@@ -556,7 +538,7 @@ Credentials are provided through environment variables:
 ```powershell
 $env:SMB_BENUTZER="username"
 $env:SMB_PASSWORT="password"
-python medien_katalog_web.py
+python mnemosyne_web_v4_15_29.py
 ```
 
 ### Linux
@@ -564,7 +546,7 @@ python medien_katalog_web.py
 ```bash
 export SMB_BENUTZER="username"
 export SMB_PASSWORT="password"
-python3 medien_katalog_web.py
+python3 mnemosyne_web_v4_15_29.py
 ```
 
 By default, SMB credentials are only allowed for private/local addresses.
@@ -575,11 +557,13 @@ For desktop installations, mounting the network share through Windows or Linux i
 
 ## Database behavior
 
-The SQLite database is stored next to the Python script:
+The SQLite database is stored in the persistent `data/` folder:
 
 ```text
-medien_katalog.sqlite3
+data/medien_katalog.sqlite3
 ```
+
+It is shared by the AppImage, portable EXE, and source version if they are launched from the same Mnemosyne directory.
 
 A full scan:
 
@@ -600,7 +584,7 @@ Manual IMDb mappings and manual kids-content flags are retained.
 Poster images are cached locally in:
 
 ```text
-cover_cache/
+data/cover_cache/
 ```
 
 The cache reduces repeated image downloads.
@@ -616,20 +600,14 @@ When a title is manually reassigned to another IMDb entry, the corresponding pos
 A recommended `.gitignore` is:
 
 ```gitignore
-# Private configuration
-config.txt
+# Private, persistent user data
+data/
 
-# Local database and caches
-medien_katalog.sqlite3
-medien_katalog.sqlite3-shm
-medien_katalog.sqlite3-wal
-cover_cache/
-
-# Optional local artwork
-background.jpg
-background.png
-
-# Generated exports
+# Generated binaries and build intermediates
+*.AppImage
+*.exe
+.mnemosyne_appimage_build/
+.mnemosyne_portable_build/
 *.pdf
 
 # Python
@@ -654,7 +632,17 @@ Movies-Path=\\SERVER\Media\Movies
 Series-Path=\\SERVER\Media\Series
 ```
 
-Users can then copy it to `config.txt` and enter their own values.
+Users can copy it to `data/config.txt` and enter their own values.
+
+---
+
+## Portable release notes
+
+- The AppImage and Windows EXE are separate builds of the same Python application.
+- Both can keep their persistent state in the same `data/` folder when placed side-by-side.
+- Chromium/Chrome is still an external runtime dependency.
+- AppImage compatibility depends on the target Linux system and its available libraries.
+- Before sharing a portable folder, remove personal API keys, credentials, and your private library database.
 
 ---
 
@@ -666,7 +654,7 @@ Users can then copy it to `config.txt` and enter their own values.
 - Manual IMDb assignment is available for ambiguous or incorrect matches.
 - OMDb age ratings are not guaranteed to correspond to German FSK ratings.
 - The local OMDb request counter only tracks requests made by this application.
-- Playing a movie opens it on the computer running Minimal Media Center. It does not remotely launch playback on another device.
+- Playing a movie opens it on the computer running Mnemosyne. It does not remotely launch playback on another device.
 - Network-share timestamps may behave differently depending on NAS/server/filesystem configuration.
 
 ---
@@ -676,4 +664,4 @@ Users can then copy it to `config.txt` and enter their own values.
 - Movie and TV metadata: [OMDb API](https://www.omdbapi.com/)
 - IMDb title lookup / assignment: [IMDb](https://www.imdb.com/)
 
-Minimal Media Center is not affiliated with or endorsed by IMDb or OMDb.
+Mnemosyne is not affiliated with or endorsed by IMDb or OMDb.
