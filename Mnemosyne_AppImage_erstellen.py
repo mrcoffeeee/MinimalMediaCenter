@@ -136,11 +136,35 @@ def write_appdir(work, pyinstaller_dist, icon, version):
     folder.parent.mkdir(parents=True,exist_ok=True)
     shutil.copytree(pyinstaller_dist,folder)
     launcher=appdir/'AppRun'
-    launcher.write_text('#!/bin/sh\nHERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\nexec "$HERE/usr/bin/Mnemosyne/Mnemosyne" "$@"\n')
+    # The PNG embedded in AppDir is the AppImage desktop icon. KDE/Chromium
+    # additionally need a real desktop-entry/icon mapping to display it in
+    # the taskbar; a browser favicon alone is not enough.
+    launcher.write_text(r'''#!/bin/sh
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# Portable: register only a per-user desktop shortcut and an icon cache entry.
+# The real executable, its data/ folder, and all program resources remain in
+# the AppImage. Registration is skipped if APPIMAGE is not available.
+if [ -n "${APPIMAGE:-}" ] && [ -n "${HOME:-}" ]; then
+  ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+  DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  if mkdir -p "$ICON_DIR" "$DESKTOP_DIR" 2>/dev/null; then
+    cp "$HERE/mnemosyne.png" "$ICON_DIR/mnemosyne.png" 2>/dev/null || :
+    # Desktop-file Exec quoting: spaces and %-characters in mounted paths.
+    APPIMAGE_PATH=$(printf '%s' "$APPIMAGE" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')
+    printf '[Desktop Entry]\nType=Application\nName=Mnemosyne\nExec="%s"\nIcon=mnemosyne\nStartupWMClass=Mnemosyne\nTerminal=false\nCategories=AudioVideo;Video;\n' "$APPIMAGE_PATH" > "$DESKTOP_DIR/mnemosyne.desktop" 2>/dev/null || :
+    # Native Wayland Chromium --app app_id, as reported by KDE Window Rules.
+    # Match the desktop *filename* to the actual app_id, not just WM_CLASS.
+    WAYLAND_APP_ID="chrome-127.0.0.1__-Default"
+    printf '[Desktop Entry]\nType=Application\nName=Mnemosyne\nExec="%s"\nIcon=mnemosyne\nStartupWMClass=%s\nNoDisplay=true\nTerminal=false\nCategories=AudioVideo;Video;\n' "$APPIMAGE_PATH" "$WAYLAND_APP_ID" > "$DESKTOP_DIR/$WAYLAND_APP_ID.desktop" 2>/dev/null || :
+  fi
+fi
+exec "$HERE/usr/bin/Mnemosyne/Mnemosyne" "$@"
+''', encoding="utf-8")
     launcher.chmod(0o755)
     shutil.copy2(icon,appdir/'mnemosyne.png')
+    (appdir/'.DirIcon').symlink_to('mnemosyne.png')
     desktop=appdir/'mnemosyne.desktop'
-    desktop.write_text('[Desktop Entry]\nType=Application\nName=Mnemosyne\nComment=Film- und Serienbibliothek\nExec=Mnemosyne\nIcon=mnemosyne\nTerminal=false\nCategories=AudioVideo;Video;\n',encoding='utf-8')
+    desktop.write_text('[Desktop Entry]\nType=Application\nName=Mnemosyne\nComment=Film- und Serienbibliothek\nExec=Mnemosyne\nIcon=mnemosyne\nStartupWMClass=Mnemosyne\nTerminal=false\nCategories=AudioVideo;Video;\n',encoding='utf-8')
     return appdir
 
 

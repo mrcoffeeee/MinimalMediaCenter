@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import copy
 import difflib
 import getpass
 import hashlib
@@ -58,7 +59,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
-VERSION = "4.15.29"
+VERSION = "4.15.44"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
 IMDB_SUGGEST_ENDPOINT = "https://v3.sg.media-imdb.com/suggestion/titles/x/"
 IMDB_GRAPHQL_ENDPOINT = "https://caching.graphql.imdb.com/"
@@ -875,8 +876,8 @@ def iter_smb_files(
         # Bibliotheksfehler sind je nach Authentifizierungsart unterschiedlich; die
         # Zugangsdaten selbst werden bewusst nicht ausgegeben.
         raise CatalogError(
-            f"Die SMB-Freigabe auf {host}:{port} konnte nicht gelesen werden: "
-            f"{type(exc).__name__}: {exc}"
+            f"SMB-Zugriff auf {host}:{port} fehlgeschlagen. "
+            "Bitte Benutzername, Passwort und Berechtigungen prüfen."
         ) from exc
     finally:
         try:
@@ -907,6 +908,13 @@ def iter_source_files(
     is_windows_drive = bool(re.match(r"^[A-Za-z]:[\\/]", source))
     if parsed.scheme and not is_windows_drive:
         raise CatalogError("Unterstützt werden lokale Ordner und Adressen im Format smb://IP/Freigabe.")
+    if source.startswith("\\\\") and username and password:
+        # A protected Windows UNC share can also use explicit, scan-only credentials.
+        yield from iter_smb_files(
+            _unc_to_smb_uri(source), username=username, password=password,
+            timeout=timeout, allow_public=allow_public,
+        )
+        return
     yield from iter_local_files(source)
 
 
@@ -915,6 +923,14 @@ def configured_media_sources(args: argparse.Namespace) -> list[tuple[str, str]]:
         (str(getattr(args, "movies_path", "") or DEFAULT_MOVIES_SOURCE), "movie"),
         (str(getattr(args, "series_path", "") or DEFAULT_SERIES_SOURCE), "series"),
     ]
+
+
+def scan_needs_smb_auth(args: argparse.Namespace) -> bool:
+    """Direct SMB URIs and Windows UNC shares require scan-only credentials."""
+    return any(
+        source.casefold().startswith("smb://") or source.startswith("\\\\")
+        for source, _ in configured_media_sources(args)
+    )
 
 
 def iter_configured_candidates(
@@ -2252,12 +2268,15 @@ def scan_into_database(
     *,
     password: str | None,
     omdb_key: str,
+    progress: Any = None,
 ) -> tuple[int, int, int, int]:
     """Quelle vollständig scannen und SQLite atomar auf den aktuellen Bestand bringen.
 
     Rückgabe: (Titelanzahl, entfernte Titel, echte OMDb-HTTP-Aufrufe,
     aus SQLite wiederverwendete Metadatensätze).
     """
+    if progress:
+        progress(stage="discover", current=0, total=0, title="")
     candidates = iter_configured_candidates(args, password=password)
     items = merge_candidates(candidates, only=args.nur)
     limited_scan = bool(args.max_titel and len(items) > args.max_titel)
@@ -2270,11 +2289,15 @@ def scan_into_database(
     imdb_de_available = True
     imdb_es_available = True
     scan_id = _utc_now()
+    if progress:
+        progress(stage="process", current=0, total=len(items), title="")
     connection = open_database(args.db)
     try:
         connection.execute("BEGIN IMMEDIATE")
         reused_metadata = 0
         for index, item in enumerate(items, start=1):
+            if progress:
+                progress(stage="process", current=index - 1, total=len(items), title=item.title[:110])
             key = _scan_key(item)
             old_row = connection.execute("SELECT * FROM media WHERE scan_key = ?", (key,)).fetchone()
             manual_imdb_id = str(old_row["manual_imdb_id"]) if old_row else ""
@@ -2550,6 +2573,8 @@ def scan_into_database(
                 ),
             )
 
+        if progress:
+            progress(stage="commit", current=len(items), total=len(items), title="")
         removed = 0
         if not limited_scan:
             cursor = connection.execute("DELETE FROM media WHERE last_seen_scan <> ?", (scan_id,))
@@ -3878,7 +3903,7 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
             f'<button class="plot-more" type="button" aria-expanded="false" '
             f'aria-controls="plot-{int(row["id"])}" data-i18n="plotMore" '
             f'onclick="togglePlot(this)">Mehr anzeigen</button>'
-            if max(len(plot_en_raw), len(plot_de_raw), len(plot_es_raw)) > 150 else ""
+            if any((plot_en_raw, plot_de_raw, plot_es_raw)) else ""
         )
         genre_raw = str(row["genre"] or "")
         director_raw = str(row["director"] or "")
@@ -3967,8 +3992,14 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
             separator = " · " if count_html and badges else ""
             seasons_html = (
                 '<div class="facts seasons"><span data-i18n="seasonsLabel">Staffeln</span>: ' + count_html + separator +
-                '<span class="season-badges">' + "".join(badges) + '</span></div>'
+                '<span class="season-badges" id="season-badges-' + str(int(row["id"])) + '">' +
+                "".join(badges) + '</span>' +
+                '<button class="season-expand" type="button" hidden aria-expanded="false" ' +
+                'aria-controls="season-badges-' + str(int(row["id"])) + '" ' +
+                'onclick="toggleSeasons(this)"></button></div>'
             )
+        if str(row["kind"]) == "series" and not seasons_html:
+            seasons_html = '<div class="facts seasons"><span data-i18n="seasonsLabel">Staffeln</span>: —</div>'
         server_added_raw = str(row["server_added_at"] or "")
         server_added_ts = 0
         server_added_display = ""
@@ -4012,12 +4043,15 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
                 {f'<div class="facts director"><span data-i18n="directorLabel">Regie</span>: {director}</div>' if director else ''}
                 {f'<div class="facts actors"><span data-i18n="castLabel">Besetzung</span>: {actors}</div>' if actors else ''}
                 {f'<div class="facts awards"><span data-i18n="awardsLabel">Auszeichnungen</span>: {html.escape(awards_raw)}</div>' if awards_raw else ''}
-                {seasons_html}
+                {'<button class="meta-expand" type="button" hidden aria-expanded="false" onclick="toggleSeriesMetadata(this)"></button>'}
                 </div>
               </div>
+              {seasons_html}
               <div class="content card-bottom">
+                <div class="series-description">
                 <p class="localized-plot" id="plot-{int(row['id'])}" data-plot-en="{html.escape(plot_en_raw, quote=True)}" data-plot-de="{html.escape(plot_de_raw, quote=True)}" data-plot-es="{html.escape(plot_es_raw, quote=True)}">{plot}</p>
                 {plot_toggle_html}
+                </div><div class="series-actions">
                 <div class="links">{imdb_html}{trailer_html}<button class="play-button" type="button" onclick="startMedia({int(row['id'])}, this, '{'series' if str(row['kind']) == 'series' else 'movie'}')" data-i18n="{'openFolder' if str(row['kind']) == 'series' else 'playFilm'}">{'Ordner öffnen' if str(row['kind']) == 'series' else 'Film starten'}</button><span>{int(row['file_count'])} <span data-i18n="files">Datei(en)</span></span></div>
                 <details>
                   <summary data-i18n="sourceCorrection">Quelle &amp; Korrektur</summary>
@@ -4040,6 +4074,7 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
                   </form>
                   {f'<form method="post" action="/reset/{int(row["id"])}" onsubmit="saveViewState(this)"><button class="secondary" type="submit" data-i18n="removeManualMapping">Manuelle Zuordnung entfernen</button></form>' if manual else ''}
                 </details>
+                </div>
               </div>
             </article>
             """
@@ -4059,7 +4094,7 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
         title_es = str(row["spanish_title_imdb"] or title_en)
         poster_ok = bool(_safe_poster_url(str(row["poster"] or ""))) or bool(IMDB_ID_RE.fullmatch(str(row["imdb_id"] or "")))
         photo = (
-            f'<img loading="lazy" decoding="async" src="/poster/{mid}?v={_poster_version_token(row)}" '
+            f'<img loading="eager" fetchpriority="high" decoding="async" src="/poster/{mid}?v={_poster_version_token(row)}" '
             f'alt="" onerror="this.style.display=\'none\';">'
             if poster_ok else '<div class="featured-placeholder" aria-hidden="true">▷</div>'
         )
@@ -4128,8 +4163,9 @@ def render_web_catalog(args: argparse.Namespace, *, notice: str = "", error: str
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mnemosyne</title>
-<link rel="icon" href="/favicon.ico" sizes="any">
-<link rel="icon" type="image/png" href="/mnemosyne_icon.png">
+<link rel="icon" type="image/png" sizes="256x256" href="/mnemosyne_icon.png?v=4.15.44">
+<link rel="shortcut icon" href="/favicon.ico?v=4.15.44" type="image/x-icon">
+<link rel="preload" as="image" href="/mnemosyne_icon.png?v=4.15.44">
 <style>
 :root {{ color-scheme: dark; --bg:#111318; --panel:#1a1e25; --muted:#a7afbd; --line:#2b313b; --accent:#f5c451; --play:#36c978; --play-hover:#48da8a; }}
 * {{ box-sizing:border-box; }}
@@ -4183,6 +4219,7 @@ main {{ padding:24px max(18px,4vw) 50px; }}
 .age-rating {{ display:flex; align-items:center; gap:4px; flex-wrap:wrap; margin-top:2px; }}
 .seasons {{ display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-top:4px; }}
 .season-badges {{ display:inline-flex; flex-wrap:wrap; gap:4px; }}
+.card > .seasons {{ grid-column:1/-1; padding:6px 12px 0; }}
 .season-badge {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; padding:2px 6px; border-radius:999px; border:1px solid rgba(160,170,185,.28); font-size:.74rem; line-height:1.25; }}
 .season-badge.available {{ background:rgba(76,175,80,.16); border-color:rgba(95,190,100,.42); color:#a7e7aa; }}
 .season-badge.missing {{ background:rgba(140,150,165,.08); color:var(--muted); opacity:.72; }}
@@ -4401,6 +4438,112 @@ dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6
 .metro-library-section .card h2 small {{font-size:.73rem;white-space:normal}}
 .metro-library-section .card .card-summary .rating {{font-size:1rem;margin-bottom:2px}}
 .metro-library-section .card .facts {{font-size:.73rem;line-height:1.34;overflow-wrap:anywhere}}
+/* Season availability spans the whole card, including the area under the poster. */
+.metro-library-section .card > .seasons {{
+  display:flex;
+  align-items:flex-start;
+  flex-wrap:wrap;
+  gap:5px;
+  width:100%;
+  min-width:0;
+  padding:9px 12px 0;
+  margin-top:0;
+  box-sizing:border-box;
+}}
+.metro-library-section .card > .seasons .season-badges {{
+  display:flex;
+  flex:1 1 100%;
+  width:100%;
+  flex-wrap:wrap;
+  justify-content:flex-start;
+  align-items:center;
+  gap:4px;
+}}
+.metro-library-section .card > .seasons .season-badge {{flex:0 0 auto;}}
+/* Compact seasons: no row-to-row equalization and no reserved blank zones.
+   Three lines are visible by default; the rest can be expanded per card. */
+.metro-library-section .card > .seasons {{
+  border-top:1px solid rgba(140,173,194,.24);
+  margin:13px 12px 0;
+  padding:10px 0 0;
+  width:calc(100% - 24px);
+  display:block;
+}}
+.metro-library-section .card > .seasons .season-count {{font-weight:600;color:#d5e5ed}}
+.metro-library-section .card > .seasons .season-badges {{
+  display:flex;
+  width:100%;
+  flex-wrap:wrap;
+  gap:4px;
+  margin-top:8px;
+  max-height:44px; /* 2 lines of 20px pills with 4px gap */
+  overflow:hidden;
+  align-content:flex-start;
+}}
+.metro-library-section .card > .seasons .season-badge {{
+  flex:0 0 auto;
+  box-sizing:border-box;
+  height:20px;
+  line-height:15px;
+  padding:2px 6px;
+}}
+.metro-library-section .card > .seasons .season-badges.expanded {{
+  max-height:none;
+  overflow:visible;
+}}
+.metro-library-section .card > .seasons .season-expand {{
+  display:block;
+  width:100%;
+  margin:7px 0 0;
+  padding:3px 0;
+  background:none;
+  border:0;
+  color:#9fe5ec;
+  text-align:left;
+  cursor:pointer;
+  font-size:.78rem;
+  font-weight:600;
+}}
+.metro-library-section .card > .seasons .season-expand[hidden] {{display:none;}}
+.metro-library-section .card > .seasons .season-expand:hover {{text-decoration:underline;}}
+.metro-library-section .card .content.card-bottom {{padding-top:13px;}}
+/* The compact series header contains ONLY title, rating, genre and age.
+   All secondary details remain accessible through the explicit toggle.
+   This keeps the header no taller than the poster in the usual case. */
+.metro-library-section .card[data-kind="series"] .card-summary:not(.meta-expanded) .added-date,
+.metro-library-section .card[data-kind="series"] .card-summary:not(.meta-expanded) .director,
+.metro-library-section .card[data-kind="series"] .card-summary:not(.meta-expanded) .actors,
+.metro-library-section .card[data-kind="series"] .card-summary:not(.meta-expanded) .awards {{
+  display:none;
+}}
+.metro-library-section .card[data-kind="series"] .card-summary.meta-expanded .added-date,
+.metro-library-section .card[data-kind="series"] .card-summary.meta-expanded .director,
+.metro-library-section .card[data-kind="series"] .card-summary.meta-expanded .actors,
+.metro-library-section .card[data-kind="series"] .card-summary.meta-expanded .awards {{
+  display:block;
+  overflow:visible;
+}}
+.metro-library-section .card .meta-expand {{
+  background:none;
+  border:0;
+  padding:5px 0 0;
+  color:#9fe5ec;
+  font-size:.73rem;
+  text-align:left;
+  cursor:pointer;
+}}
+.metro-library-section .card .meta-expand[hidden] {{display:none;}}
+.metro-library-section .card .meta-expand:hover {{text-decoration:underline;}}
+.metro-library-section .card .content.card-bottom {{padding-top:12px;}}
+
+
+/* Series description follows the season badges immediately; buttons stay at the bottom.
+   The top header is as tall as the cover (not a variable-length award list). */
+.metro-library-section .card[data-kind="series"] .card-top {{align-items:start;}}
+.metro-library-section .card[data-kind="series"] > .seasons {{margin-top:12px;}}
+.metro-library-section .card[data-kind="series"] .content.card-bottom {{padding-top:12px;}}
+.metro-library-section .card[data-kind="series"] .meta-expand {{line-height:1.25;}}
+
 .metro-library-section .card .content.card-bottom {{
   flex:1;
   width:100%;
@@ -4602,6 +4745,24 @@ dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6
 @media(prefers-reduced-motion:reduce){{html{{scroll-behavior:auto}}}}
 
 
+/* Credentials are requested only in memory, never written to config or storage. */
+dialog.smb-auth-dialog {{width:min(420px,calc(100% - 28px));padding:0;background:#223444;color:#f5f7fa;border:1px solid #536a80;border-radius:5px;box-shadow:0 25px 65px rgba(0,0,0,.55)}}
+dialog.smb-auth-dialog::backdrop {{background:rgba(0,0,0,.73)}}
+.smb-auth-inner {{padding:25px;display:flex;flex-direction:column;gap:13px}}
+.smb-auth-inner h2 {{margin:0 0 2px;font-size:1.22rem}}
+.smb-auth-inner p {{margin:0;color:#b4cadb;line-height:1.45;font-size:.91rem}}
+.smb-auth-inner label {{display:flex;flex-direction:column;gap:5px;font-size:.9rem}}
+.smb-auth-inner input {{width:100%;box-sizing:border-box;background:#101e2b;color:white;border:1px solid #647f92;border-radius:3px;padding:10px;font-size:1rem}}
+.smb-auth-actions {{display:flex;justify-content:flex-end;gap:10px;margin-top:4px}}
+/* Persistent scan progress modal: independent from the initial library warmup. */
+dialog.scan-progress-dialog {{width:min(480px,calc(100% - 30px));background:#223444;color:#eff8ff;padding:0;border:1px solid #56758e;border-radius:5px;box-shadow:0 24px 70px #0009}}
+dialog.scan-progress-dialog::backdrop {{background:rgba(5,12,20,.8);backdrop-filter:blur(3px)}}
+.scan-progress-inner {{padding:30px;display:flex;flex-direction:column;gap:15px;align-items:center;text-align:center}}
+.scan-progress-inner h2 {{font-size:1.18rem;margin:0}}
+.scan-progress-inner p {{margin:0;color:#c2d6e6;line-height:1.5}}
+.scan-progress-inner progress {{width:100%;height:15px;accent-color:#72c8e7}}
+.scan-progress-inner #scanProgressCount {{font-size:.91rem;font-weight:600}}
+.scan-progress-inner .scan-progress-current {{font-size:.82rem;max-width:100%;overflow-wrap:anywhere;min-height:1.4em;opacity:.82}}
 /* Short, non-blocking visual feedback before first large library layout. */
 .library-loading {{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;background:rgba(9,22,34,.88);backdrop-filter:blur(3px);}}
 .library-loading[hidden] {{display:none !important}}
@@ -4610,6 +4771,269 @@ dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6
 .library-spinner {{width:41px;height:41px;border:4px solid rgba(126,199,229,.2);border-top-color:#81c9e8;border-radius:50%;animation:library-spin .85s linear infinite}}
 @keyframes library-spin {{to {{transform:rotate(360deg)}}}}
 @media (prefers-reduced-motion:reduce) {{.library-spinner {{animation:none;border-top-color:#81c9e8}}}}
+
+
+/* v4.15.44 -- EXACT SIZES in the collapsed state, not minmax(auto).
+   This is restricted to series cards. Content in excess of its track is
+   clipped; its own accessible expansion button lets that track grow. */
+.metro-library-section .card[data-kind="series"] {{
+  --series-header-h:224px;
+  --series-seasons-h:110px;
+  --series-description-h:120px;
+  --series-actions-h:132px;
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:var(--series-header-h) var(--series-seasons-h) calc(var(--series-description-h) + var(--series-actions-h));
+  height:calc(var(--series-header-h) + var(--series-seasons-h) + var(--series-description-h) + var(--series-actions-h));
+  min-height:0;
+  align-items:stretch;
+  align-content:start;
+}}
+.metro-library-section .card[data-kind="series"] > .card-top {{
+  box-sizing:border-box;
+  width:100%;height:var(--series-header-h);min-height:0;
+  margin:0;padding:11px 11px 10px;
+  overflow:hidden;
+  align-items:start;
+}}
+.metro-library-section .card[data-kind="series"] .poster-slot {{
+  width:100%;max-height:182px;aspect-ratio:2/3;
+}}
+.metro-library-section .card[data-kind="series"] .card-summary {{
+  min-height:0;max-height:197px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="series"] > .seasons {{
+  display:block;
+  box-sizing:border-box;
+  height:var(--series-seasons-h);min-height:0;
+  width:calc(100% - 24px);margin:0 12px;
+  padding:10px 0 8px;overflow:hidden;
+  border-top:1px solid rgba(140,173,194,.28);
+}}
+.metro-library-section .card[data-kind="series"] > .seasons .season-badges {{
+  display:flex;width:100%;flex-wrap:wrap;gap:4px;
+  height:auto;max-height:44px;overflow:hidden;
+  margin-top:8px;align-content:flex-start;
+}}
+.metro-library-section .card[data-kind="series"] > .content.card-bottom {{
+  display:grid;box-sizing:border-box;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:var(--series-description-h) var(--series-actions-h);
+  width:100%;height:calc(var(--series-description-h) + var(--series-actions-h));
+  min-height:0;margin:0;padding:0 12px 10px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="series"] .series-description {{
+  box-sizing:border-box;height:var(--series-description-h);min-height:0;
+  padding-top:11px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="series"] .series-actions {{
+  box-sizing:border-box;height:var(--series-actions-h);
+  min-height:0;display:flex;flex-direction:column;
+  justify-content:flex-end;
+}}
+.metro-library-section .card[data-kind="series"] .series-actions .links {{
+  margin-top:0;
+}}
+.metro-library-section .card[data-kind="series"] .series-actions details {{
+  flex-shrink:0;
+}}
+/* v4.15.44: short synopsis preview MUST leave space for its disclosure.
+   Five lines + disclosure no longer fit the 120px fixed description track. */
+.metro-library-section .card[data-kind="series"] .series-description .localized-plot:not(.expanded) {{
+  display:-webkit-box;
+  -webkit-box-orient:vertical;
+  -webkit-line-clamp:3;
+  line-clamp:3;
+  overflow:hidden;
+}}
+.metro-library-section .card[data-kind="series"] .series-description .plot-more {{
+  display:inline-block;
+  line-height:20px;
+  min-height:20px;
+  margin-top:2px;
+  padding:0;
+  cursor:pointer;
+}}
+.metro-library-section .card[data-kind="series"] .series-description .plot-more[hidden] {{display:none;}}
+/* Hide the optional description disclosure when the text fits. */
+.metro-library-section .card[data-kind="series"] .plot-more[hidden] {{display:none;}}
+/* A clicked expander grows only its own track; collapsed cards always have
+   identical section heights, including when another card has many seasons. */
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded) {{
+  height:auto;
+  grid-template-rows:max-content var(--series-seasons-h) calc(var(--series-description-h) + var(--series-actions-h));
+}}
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded) > .card-top {{
+  height:auto;min-height:var(--series-header-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded) .card-summary {{
+  max-height:none;overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"]:has(> .seasons .season-badges.expanded) {{
+  height:auto;
+  grid-template-rows:var(--series-header-h) max-content calc(var(--series-description-h) + var(--series-actions-h));
+}}
+.metro-library-section .card[data-kind="series"]:has(> .seasons .season-badges.expanded) > .seasons {{
+  height:auto;min-height:var(--series-seasons-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"] > .seasons .season-badges.expanded {{
+  max-height:none;overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"]:has(.localized-plot.expanded) {{
+  height:auto;
+  grid-template-rows:var(--series-header-h) var(--series-seasons-h) max-content;
+}}
+.metro-library-section .card[data-kind="series"]:has(.localized-plot.expanded) > .content.card-bottom {{
+  height:auto;grid-template-rows:max-content var(--series-actions-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"]:has(.localized-plot.expanded) .series-description {{
+  height:auto;min-height:var(--series-description-h);overflow:visible;
+}}
+/* Combine expansions using the same intrinsic-size behavior for all three
+   tracks. */
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded):has(> .seasons .season-badges.expanded) {{
+  grid-template-rows:max-content max-content calc(var(--series-description-h) + var(--series-actions-h));
+}}
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded):has(.localized-plot.expanded) {{
+  grid-template-rows:max-content var(--series-seasons-h) max-content;
+}}
+.metro-library-section .card[data-kind="series"]:has(> .seasons .season-badges.expanded):has(.localized-plot.expanded) {{
+  grid-template-rows:var(--series-header-h) max-content max-content;
+}}
+.metro-library-section .card[data-kind="series"]:has(.meta-expanded):has(> .seasons .season-badges.expanded):has(.localized-plot.expanded) {{
+  grid-template-rows:max-content max-content max-content;
+}}
+.metro-library-section .card[data-kind="series"]:has(.series-actions details[open]) {{
+  height:auto;
+  grid-template-rows:var(--series-header-h) var(--series-seasons-h) max-content;
+}}
+.metro-library-section .card[data-kind="series"]:has(.series-actions details[open]) > .content.card-bottom {{
+  height:auto;grid-template-rows:var(--series-description-h) max-content;overflow:visible;
+}}
+.metro-library-section .card[data-kind="series"]:has(.series-actions details[open]) .series-actions {{
+  height:auto;min-height:var(--series-actions-h);
+}}
+@media(max-width:600px) {{
+  .metro-library-section .card[data-kind="series"] {{
+    --series-header-h:220px;
+  }}
+}}
+
+/* v4.15.44 -- movie cards use the same reliable fixed-track design
+   as v4.15.42 series cards, without an empty season section. */
+.metro-library-section .card[data-kind="movie"] {{
+  --movie-header-h:224px;
+  --movie-description-h:120px;
+  --movie-actions-h:132px;
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:var(--movie-header-h) calc(var(--movie-description-h) + var(--movie-actions-h));
+  height:calc(var(--movie-header-h) + var(--movie-description-h) + var(--movie-actions-h));
+  min-height:0;
+  align-items:stretch;
+  align-content:start;
+}}
+.metro-library-section .card[data-kind="movie"] > .card-top {{
+  box-sizing:border-box;width:100%;height:var(--movie-header-h);
+  min-height:0;margin:0;padding:11px 11px 10px;
+  overflow:hidden;align-items:start;
+}}
+.metro-library-section .card[data-kind="movie"] .poster-slot {{
+  width:100%;max-height:182px;aspect-ratio:2/3;
+}}
+.metro-library-section .card[data-kind="movie"] .card-summary {{
+  min-height:0;max-height:197px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="movie"] .card-summary:not(.meta-expanded) .added-date,
+.metro-library-section .card[data-kind="movie"] .card-summary:not(.meta-expanded) .director,
+.metro-library-section .card[data-kind="movie"] .card-summary:not(.meta-expanded) .actors,
+.metro-library-section .card[data-kind="movie"] .card-summary:not(.meta-expanded) .awards {{display:none;}}
+.metro-library-section .card[data-kind="movie"] .card-summary.meta-expanded .added-date,
+.metro-library-section .card[data-kind="movie"] .card-summary.meta-expanded .director,
+.metro-library-section .card[data-kind="movie"] .card-summary.meta-expanded .actors,
+.metro-library-section .card[data-kind="movie"] .card-summary.meta-expanded .awards {{display:block;overflow:visible;}}
+.metro-library-section .card[data-kind="movie"] > .content.card-bottom {{
+  display:grid;box-sizing:border-box;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-rows:var(--movie-description-h) var(--movie-actions-h);
+  width:100%;height:calc(var(--movie-description-h) + var(--movie-actions-h));
+  min-height:0;margin:0;padding:0 12px 10px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="movie"] .series-description {{
+  box-sizing:border-box;height:var(--movie-description-h);
+  min-height:0;padding-top:11px;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="movie"] .series-actions {{
+  box-sizing:border-box;height:var(--movie-actions-h);
+  min-height:0;display:flex;flex-direction:column;justify-content:flex-end;
+}}
+.metro-library-section .card[data-kind="movie"] .series-actions .links {{margin-top:0;}}
+.metro-library-section .card[data-kind="movie"] .series-actions details {{flex-shrink:0;}}
+.metro-library-section .card[data-kind="movie"] .series-description .localized-plot:not(.expanded) {{
+  display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:3;line-clamp:3;overflow:hidden;
+}}
+.metro-library-section .card[data-kind="movie"] .series-description .plot-more {{
+  display:inline-block;line-height:20px;min-height:20px;margin-top:2px;padding:0;cursor:pointer;
+}}
+.metro-library-section .card[data-kind="movie"] .series-description .plot-more[hidden] {{display:none;}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded) {{
+  height:auto;
+  grid-template-rows:max-content calc(var(--movie-description-h) + var(--movie-actions-h));
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded) > .card-top {{
+  height:auto;min-height:var(--movie-header-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded) .card-summary {{
+  max-height:none;overflow:visible;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.localized-plot.expanded) {{
+  height:auto;grid-template-rows:var(--movie-header-h) max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.localized-plot.expanded) > .content.card-bottom {{
+  height:auto;grid-template-rows:max-content var(--movie-actions-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.localized-plot.expanded) .series-description {{
+  height:auto;min-height:var(--movie-description-h);overflow:visible;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded):has(.localized-plot.expanded) {{
+  grid-template-rows:max-content max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.series-actions details[open]) {{
+  height:auto;grid-template-rows:var(--movie-header-h) max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.series-actions details[open]) > .content.card-bottom {{
+  height:auto;grid-template-rows:var(--movie-description-h) max-content;overflow:visible;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.series-actions details[open]) .series-actions {{
+  height:auto;min-height:var(--movie-actions-h);
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded):has(.series-actions details[open]) {{
+  grid-template-rows:max-content max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.localized-plot.expanded):has(.series-actions details[open]) > .content.card-bottom {{
+  grid-template-rows:max-content max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded):has(.localized-plot.expanded):has(.series-actions details[open]) {{
+  grid-template-rows:max-content max-content;
+}}
+.metro-library-section .card[data-kind="movie"]:has(.meta-expanded):has(.localized-plot.expanded):has(.series-actions details[open]) > .content.card-bottom {{
+  grid-template-rows:max-content max-content;
+}}
+@media(max-width:600px) {{
+  .metro-library-section .card[data-kind="movie"] {{--movie-header-h:220px;}}
+}}
+
+/* 4.15.44: browser skips layout/paint of off-screen cards. The pre-set intrinsic
+   height reserves the correct scroll area until the card enters the viewport. */
+.metro-library-section .card[data-kind="movie"] {{
+  content-visibility:auto;
+  contain-intrinsic-size:auto 476px;
+}}
+.metro-library-section .card[data-kind="series"] {{
+  content-visibility:auto;
+  contain-intrinsic-size:auto 586px;
+}}
 </style>
 </head>
 <body>
@@ -4637,6 +5061,26 @@ dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6
   </div>
 
 </header>
+<dialog id="smbAuthDialog" class="smb-auth-dialog" aria-labelledby="smbAuthTitle">
+  <form id="smbAuthForm" class="smb-auth-inner" autocomplete="off" onsubmit="submitSmbCredentials(event)">
+    <h2 id="smbAuthTitle" data-i18n="smbAuthTitle">SMB-Anmeldung</h2>
+    <p data-i18n="smbAuthHint">Für die Aktualisierung der Bibliothek benötigt der Medienserver Zugangsdaten. Sie werden nicht gespeichert.</p>
+    <label><span data-i18n="smbUsername">Benutzername</span><input id="smbUsername" name="username" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="256" required></label>
+    <label><span data-i18n="smbPassword">Passwort</span><input id="smbPassword" name="password" type="password" autocomplete="off" maxlength="1024" required></label>
+    <div class="smb-auth-actions"><button type="button" class="secondary" onclick="closeSmbAuthDialog()" data-i18n="cancel">Abbrechen</button><button type="submit" id="smbAuthSubmit" data-i18n="smbConnect">Anmelden und aktualisieren</button></div>
+  </form>
+</dialog>
+<dialog id="scanProgressDialog" class="scan-progress-dialog" aria-labelledby="scanProgressTitle" aria-modal="true">
+  <div class="scan-progress-inner">
+    <span class="library-spinner" aria-hidden="true"></span>
+    <h2 id="scanProgressTitle">Bibliothek wird aktualisiert</h2>
+    <p id="scanProgressPhase" role="status" aria-live="polite">Verbindung wird hergestellt …</p>
+    <progress id="scanProgressBar" max="100"></progress>
+    <span id="scanProgressCount">Medien werden gesucht …</span>
+    <p id="scanProgressTitleName" class="scan-progress-current"></p>
+    <button id="scanProgressClose" class="secondary" type="button" hidden onclick="closeScanProgressDialog()">Schließen</button>
+  </div>
+</dialog>
 <div class="metro-layout">
   <aside class="metro-sidebar" aria-label="Bibliotheks-Navigation">
     <button class="metro-nav-btn active" type="button" data-metro-view="overview" onclick="setMetroView('overview')"><span class="metro-nav-icon">⌂</span><span data-i18n="navOverview">Übersicht</span></button>
@@ -4644,7 +5088,7 @@ dialog.config-dialog,dialog.random-dialog {{background:#223444;border-color:#4a6
     <button class="metro-nav-btn" type="button" data-metro-view="series" onclick="setMetroView('series')"><span class="metro-nav-icon">▣</span><span data-i18n="navSeries">Serien</span></button>
     <button class="metro-nav-btn" type="button" data-metro-view="favorites" onclick="setMetroView('favorites')"><span class="metro-nav-icon">☆</span><span data-i18n="navFavorites">Favoriten</span></button>
     <button class="metro-nav-btn" type="button" data-metro-view="history" onclick="setMetroView('history')"><span class="metro-nav-icon">◷</span><span data-i18n="navHistory">Verlauf</span></button>
-    <div class="metro-sidebar-footer"><strong>MNEMOSYNE</strong><span>v4.15.29</span><span class="metro-author-line">Johannes Wronka<br>ChatGPT (OpenAI)</span></div>
+    <div class="metro-sidebar-footer"><strong>MNEMOSYNE</strong><span>v4.15.44</span><span class="metro-author-line">Johannes Wronka<br>ChatGPT (OpenAI)</span></div>
   </aside>
   <div class="metro-content">
     <section class="metro-overview" id="metroOverview" aria-label="Bibliotheksübersicht">
@@ -4863,6 +5307,37 @@ function browserPaint() {{
   return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 }}
 function shortYield() {{return new Promise(resolve => setTimeout(resolve, 70));}}
+// Chromium may initially display a generic app icon until it has fetched its
+// first favicon. Refresh the link after the resource becomes available; the
+// catalog refresh already implicitly did this by navigating to a new page.
+async function initializeMnemosyneIcon() {{
+  const url = '/mnemosyne_icon.png?v=4.15.44';
+  try {{
+    const response = await fetch(url, {{cache:'force-cache'}});
+    if (!response.ok) return;
+    await response.blob();
+    const link = document.querySelector('link[rel="icon"]');
+    if (link) {{
+      const fresh = link.cloneNode();
+      fresh.href = url + '&ready=1';
+      link.replaceWith(fresh);
+    }}
+  }} catch (error) {{console.debug('Mnemosyne-Icon:', error);}}
+}}
+async function waitForOverviewPosters() {{
+  // Image requests in the overview must finish (success OR failure) before
+  // releasing the startup overlay. Previously `loading=lazy` delayed them.
+  const posters = Array.from(document.querySelectorAll('#metroFeatured img'));
+  if (!posters.length) return;
+  await Promise.race([
+    Promise.all(posters.map(img => img.complete ? Promise.resolve() :
+      new Promise(resolve => {{
+        img.addEventListener('load', resolve, {{once:true}});
+        img.addEventListener('error', resolve, {{once:true}});
+      }}))),
+    new Promise(resolve => setTimeout(resolve, 6000))
+  ]);
+}}
 async function prepareLibraryOnStartup() {{
   // Render and lay out each catalog section BEFORE making the dashboard usable.
   // This work is deliberately scheduled across different tasks so the progress
@@ -4900,8 +5375,9 @@ async function prepareLibraryOnStartup() {{
     updateMetroNavigation();
     if (overview) void overview.offsetHeight;
     await browserPaint();
-    // Allow any queued image/layout work for the initial visible viewport to settle.
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Prepare the actual overview covers before users can interact.
+    await waitForOverviewPosters();
+    await new Promise(resolve => setTimeout(resolve, 250));
     await browserPaint();
   }} catch (error) {{
     console.error('Mnemosyne: preparation failed:', error);
@@ -4972,7 +5448,7 @@ const I18N = {{
     removeKids:'Kinder-Markierung entfernen', markKids:'Als Kinderinhalt markieren',
     manualFixed:'manuell festgelegt', autoDetected:'automatisch erkannt',
     removeManualMapping:'Manuelle Zuordnung entfernen', scanning:'Bibliothek wird aktualisiert …',
-    scanFailed:'Bibliothek konnte nicht aktualisiert werden.', starting:'Öffne …', started:'Geöffnet',
+    scanFailed:'Bibliothek konnte nicht aktualisiert werden.', smbAuthTitle:'SMB-Anmeldung', smbAuthHint:'Für die Aktualisierung der Bibliothek benötigt der Medienserver Zugangsdaten. Sie werden nur für diesen Scan verwendet und nicht gespeichert.', smbUsername:'Benutzername', smbPassword:'Passwort', smbConnect:'Anmelden und aktualisieren', starting:'Öffne …', started:'Geöffnet',
     playFailed:'Medienaktion konnte nicht ausgeführt werden.', randomMovie:'Zufälliger Film',
     randomMovieTitle:'Dein Zufallsfilm', anotherRandom:'Noch einen', close:'Schließen', noMovies:'Keine Filme in der Bibliothek gefunden.',
     windowMinimize:'Fenster minimieren', windowClose:'Mnemosyne schließen', germanTitlePlaceholder:'Deutscher Titel', saveGermanTitle:'Deutschen Titel speichern', resetGermanTitle:'Deutschen Titel zurücksetzen', browserFallbackTitle:'Browser-Hinweis:', browserFallbackText:'Der optimierte Browsermodus ist nicht verfügbar. Mnemosyne läuft im Standardbrowser; installierte Erweiterungen können die Oberfläche verlangsamen. Installiere Chromium, Chrome, Edge oder Brave für den isolierten Modus.'
@@ -4998,7 +5474,7 @@ const I18N = {{
     removeKids:'Remove kids tag', markKids:'Mark as kids content',
     manualFixed:'set manually', autoDetected:'detected automatically',
     removeManualMapping:'Remove manual match', scanning:'Updating library …',
-    scanFailed:'Library could not be updated.', starting:'Opening …', started:'Opened',
+    scanFailed:'Library could not be updated.', smbAuthTitle:'SMB sign-in', smbAuthHint:'The media server requires credentials to update the library. These are used only for this scan and are not saved.', smbUsername:'Username', smbPassword:'Password', smbConnect:'Sign in and update', starting:'Opening …', started:'Opened',
     playFailed:'Media action could not be completed.', randomMovie:'Random movie',
     randomMovieTitle:'Your random movie', anotherRandom:'Another one', close:'Close', noMovies:'No movies found in the library.',
     windowMinimize:'Minimize window', windowClose:'Close Mnemosyne', germanTitlePlaceholder:'German title', saveGermanTitle:'Save German title', resetGermanTitle:'Reset German title', browserFallbackTitle:'Browser notice:', browserFallbackText:'The optimized browser mode is unavailable. Mnemosyne is running in your default browser; installed extensions may slow the interface down. Install Chromium, Chrome, Edge or Brave for isolated mode.'
@@ -5024,7 +5500,7 @@ const I18N = {{
     removeKids:'Quitar etiqueta infantil', markKids:'Marcar como contenido infantil',
     manualFixed:'establecido manualmente', autoDetected:'detectado automáticamente',
     removeManualMapping:'Eliminar asignación manual', scanning:'Actualizando biblioteca …',
-    scanFailed:'No se pudo actualizar la biblioteca.', starting:'Abriendo …', started:'Abierto',
+    scanFailed:'No se pudo actualizar la biblioteca.', smbAuthTitle:'Acceso SMB', smbAuthHint:'El servidor requiere credenciales para actualizar la biblioteca. Solo se usan para este análisis y no se guardan.', smbUsername:'Usuario', smbPassword:'Contraseña', smbConnect:'Acceder y actualizar', starting:'Abriendo …', started:'Abierto',
     playFailed:'No se pudo completar la acción multimedia.', randomMovie:'Película aleatoria',
     randomMovieTitle:'Tu película aleatoria', anotherRandom:'Otra', close:'Cerrar', noMovies:'No se encontraron películas en la biblioteca.',
     windowMinimize:'Minimizar ventana', windowClose:'Cerrar Mnemosyne', germanTitlePlaceholder:'Título alemán', saveGermanTitle:'Guardar título alemán', resetGermanTitle:'Restablecer título alemán', browserFallbackTitle:'Aviso del navegador:', browserFallbackText:'El modo de navegador optimizado no está disponible. Mnemosyne se ejecuta en el navegador predeterminado; las extensiones instaladas pueden ralentizar la interfaz. Instala Chromium, Chrome, Edge o Brave para usar el modo aislado.'
@@ -5056,6 +5532,8 @@ function localizedGenreList(raw) {{
   return parts.join(', ');
 }}
 
+const MNEMOSYNE_SCAN_NEEDS_SMB_AUTH = {str(scan_needs_smb_auth(args)).lower()};
+
 const STATUS_I18N = {{
   de: {{ 'manual':'Manuell', 'gefunden':'gefunden', 'nicht zugeordnet':'nicht zugeordnet', 'metadaten deaktiviert':'Metadaten deaktiviert', 'manuell zugeordnet':'Manuell' }},
   en: {{ 'manual':'Manual', 'gefunden':'found', 'nicht zugeordnet':'not matched', 'metadaten deaktiviert':'metadata disabled', 'manuell zugeordnet':'Manual' }},
@@ -5070,6 +5548,7 @@ function togglePlot(button) {{
   const key = expanded ? 'plotLess' : 'plotMore';
   button.dataset.i18n = key;
   button.textContent = t(key);
+  scheduleSeasonRowAlignment();
 }}
 
 function t(key) {{
@@ -5268,6 +5747,132 @@ function jumpToLetter(letter) {{
   window.setTimeout(() => {{ if (serial === alphabetJumpSerial) target.classList.remove('letter-jump'); }}, 1600);
 }}
 
+// Recalculate visibility only for series actually shown on the current page.
+// Only render and measure the small set of cards near the viewport.
+// Measuring hundreds of off-screen, line-clamped plots on each navigation
+// used to block Chromium's main thread for several seconds.
+let seasonRefreshFrame = 0;
+const cardsNearViewport = new Set();
+const cardsPendingMeasurement = new Set();
+let mediaCardObserver = null;
+function initializeVisibleCardMeasurements() {{
+  if (mediaCardObserver || !('IntersectionObserver' in window)) return;
+  mediaCardObserver = new IntersectionObserver(entries => {{
+    for (const entry of entries) {{
+      if (entry.isIntersecting) {{
+        cardsNearViewport.add(entry.target);
+        cardsPendingMeasurement.add(entry.target);
+      }} else {{
+        cardsNearViewport.delete(entry.target);
+        cardsPendingMeasurement.delete(entry.target);
+      }}
+    }}
+    queueCardMeasurements();
+  }}, {{rootMargin:'360px 0px 360px 0px', threshold:0}});
+  document.querySelectorAll('#grid .card').forEach(card => mediaCardObserver.observe(card));
+}}
+function queueCardMeasurements() {{
+  if (seasonRefreshFrame) return;
+  seasonRefreshFrame = requestAnimationFrame(() => {{
+    seasonRefreshFrame = 0;
+    if (activeMetroView === 'overview') return;
+    const batch = Array.from(cardsPendingMeasurement).slice(0, 10);
+    for (const card of batch) cardsPendingMeasurement.delete(card);
+    for (const card of batch) measureOneCard(card);
+    if (cardsPendingMeasurement.size) queueCardMeasurements();
+  }});
+}}
+function seasonButtonText(expanded, count) {{
+  const labels = {{
+    de: expanded ? 'Weniger Staffeln anzeigen' : `Alle ${{count}} Staffeln anzeigen`,
+    en: expanded ? 'Show fewer seasons' : `Show all ${{count}} seasons`,
+    es: expanded ? 'Mostrar menos temporadas' : `Mostrar las ${{count}} temporadas`
+  }};
+  return labels[activeLanguage] || labels.de;
+}}
+function toggleSeasons(button) {{
+  const pills = button.previousElementSibling;
+  if (!pills) return;
+  const expanded = pills.classList.toggle('expanded');
+  button.setAttribute('aria-expanded', String(expanded));
+  const count = pills.querySelectorAll('.season-badge').length;
+  button.textContent = seasonButtonText(expanded, count);
+}}
+function toggleSeriesMetadata(button) {{
+  const summary = button.closest('.card-summary');
+  if (!summary) return;
+  const expanded = summary.classList.toggle('meta-expanded');
+  button.setAttribute('aria-expanded', String(expanded));
+  button.textContent = activeLanguage === 'en'
+    ? (expanded ? 'Less information' : 'More information')
+    : activeLanguage === 'es'
+      ? (expanded ? 'Menos información' : 'Más información')
+      : (expanded ? 'Weniger Informationen' : 'Weitere Informationen');
+  scheduleSeasonRowAlignment();
+}}
+function measureOneCard(card) {{
+  if (!card || card.style.display === 'none' || !card.isConnected) return;
+  const pills = card.querySelector(':scope > .seasons .season-badges');
+  const button = card.querySelector(':scope > .seasons .season-expand');
+  if (pills && button) {{
+    const expanded = pills.classList.contains('expanded');
+    if (!expanded) {{
+      // Check against the natural size using scrollHeight; do not stretch
+      // other cards just because one series has dozens of seasons.
+      button.hidden = pills.scrollHeight <= pills.clientHeight + 2;
+    }}
+    if (!button.hidden) {{
+      button.textContent = seasonButtonText(expanded, pills.querySelectorAll('.season-badge').length);
+    }}
+  }}
+  const description = card.querySelector('.series-description');
+  const plot = description && description.querySelector('.localized-plot');
+  const plotToggle = description && description.querySelector('.plot-more');
+  if (plot && plotToggle) {{
+    // A -webkit-line-clamp can report a reduced scrollHeight, so
+    // checking scrollHeight/clientHeight on the clamped element itself
+    // loses the "Mehr anzeigen" button. Measure unclamped natural
+    // height briefly, then restore CSS before the next paint.
+    const expanded = plot.classList.contains('expanded');
+    const previousDisplay = plot.style.display;
+    const previousClamp = plot.style.webkitLineClamp;
+    const previousLineClamp = plot.style.lineClamp;
+    plot.style.display = 'block';
+    plot.style.webkitLineClamp = 'unset';
+    plot.style.lineClamp = 'unset';
+    const naturalHeight = plot.scrollHeight;
+    plot.style.display = previousDisplay;
+    plot.style.webkitLineClamp = previousClamp;
+    plot.style.lineClamp = previousLineClamp;
+    const lineHeight = parseFloat(getComputedStyle(plot).lineHeight) || 19;
+    // The preview is deliberately three lines; taller text needs a toggle.
+    plotToggle.hidden = !expanded && naturalHeight <= 3 * lineHeight + 2;
+  }}
+  const summary = card.querySelector('.card-summary');
+  const meta = card.querySelector('.meta-expand');
+  if (summary && meta) {{
+    // Details are intentionally hidden by default, not text-clamped.
+    // Never measure scrollHeight on a display:none element: that would
+    // incorrectly hide the toggle and lose access to its information.
+    const hasDetails = !!summary.querySelector('.added-date, .director, .actors, .awards');
+    const topClipped = summary.scrollHeight > summary.clientHeight + 2;
+    meta.hidden = !hasDetails && !topClipped;
+    const expanded = summary.classList.contains('meta-expanded');
+    meta.textContent = activeLanguage === 'en'
+      ? (expanded ? 'Less information' : 'More information')
+      : activeLanguage === 'es'
+        ? (expanded ? 'Menos información' : 'Más información')
+        : (expanded ? 'Weniger Informationen' : 'Weitere Informationen');
+  }}
+}}
+function scheduleSeasonRowAlignment(card = null) {{
+  initializeVisibleCardMeasurements();
+  if (card && card instanceof Element) cardsPendingMeasurement.add(card.closest('.card') || card);
+  else for (const visibleCard of cardsNearViewport) cardsPendingMeasurement.add(visibleCard);
+  queueCardMeasurements();
+}}
+window.addEventListener('resize', () => scheduleSeasonRowAlignment(), {{passive:true}});
+
 function filterCards() {{
   ++alphabetJumpSerial;
   resetAlphabetJumpTail();
@@ -5363,6 +5968,7 @@ function filterCards() {{
   document.getElementById('visibleCount').textContent = String(visible);
   updateFilterSummary();
   updateAlphabetNav();
+  scheduleSeasonRowAlignment();
 }}
 
 function resetFilters() {{
@@ -5478,33 +6084,128 @@ function saveViewState(form) {{
   try {{ sessionStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state)); }} catch (_) {{}}
 }}
 
+let smbRefreshPendingForm = null;
+function closeSmbAuthDialog() {{
+  const dialog = document.getElementById('smbAuthDialog');
+  if (dialog && dialog.open) dialog.close();
+  document.getElementById('smbPassword').value = '';
+  smbRefreshPendingForm = null;
+}}
+function submitSmbCredentials(event) {{
+  event.preventDefault();
+  const form = smbRefreshPendingForm;
+  if (!form) return;
+  const username = document.getElementById('smbUsername').value.trim();
+  const password = document.getElementById('smbPassword').value;
+  if (!username || !password) return;
+  closeSmbAuthDialog();
+  // Credentials are kept only in local variables during this request.
+  runLibraryScan(form, {{username, password}});
+}}
 async function refreshLibrary(event, form) {{
   event.preventDefault();
+  if (form.querySelector('button[type="submit"]').disabled) return false;
+  // Direct smb:// requires explicit credentials. Local/mounted paths do not.
+  if (MNEMOSYNE_SCAN_NEEDS_SMB_AUTH) {{
+    smbRefreshPendingForm = form;
+    const dialog = document.getElementById('smbAuthDialog');
+    document.getElementById('smbUsername').value = '';
+    document.getElementById('smbPassword').value = '';
+    if (dialog && !dialog.open) dialog.showModal();
+    document.getElementById('smbUsername').focus();
+  }} else {{
+    runLibraryScan(form, null);
+  }}
+  return false;
+}}
+let scanProgressTimer = null;
+let scanProgressBusy = false;
+function closeScanProgressDialog() {{
+  const dialog = document.getElementById('scanProgressDialog');
+  if (dialog && dialog.open) dialog.close();
+}}
+function showScanProgress() {{
+  const dialog = document.getElementById('scanProgressDialog');
+  document.getElementById('scanProgressTitle').textContent =
+    activeLanguage === 'en' ? 'Updating library' : activeLanguage === 'es' ? 'Actualizando biblioteca' : 'Bibliothek wird aktualisiert';
+  document.getElementById('scanProgressPhase').textContent =
+    activeLanguage === 'en' ? 'Connecting …' : activeLanguage === 'es' ? 'Conectando …' : 'Verbindung wird hergestellt …';
+  document.getElementById('scanProgressCount').textContent = '';
+  document.getElementById('scanProgressTitleName').textContent = '';
+  const bar = document.getElementById('scanProgressBar');
+  bar.removeAttribute('value'); // Indeterminate during SMB directory discovery.
+  document.getElementById('scanProgressClose').hidden = true;
+  if (dialog && !dialog.open) dialog.showModal();
+  if (dialog && !dialog.dataset.cancelProtected) {{
+    dialog.addEventListener('cancel', event => {{
+      if (document.getElementById('scanProgressClose').hidden) event.preventDefault();
+    }});
+    dialog.dataset.cancelProtected = '1';
+  }}
+}}
+async function pollScanProgress() {{
+  if (scanProgressBusy) return;
+  scanProgressBusy = true;
+  try {{
+    const response = await fetch('/scan-progress', {{cache:'no-store'}});
+    if (!response.ok) return;
+    const state = await response.json();
+    if (!state.running) return;
+    const phase = document.getElementById('scanProgressPhase');
+    const counter = document.getElementById('scanProgressCount');
+    const currentTitle = document.getElementById('scanProgressTitleName');
+    const bar = document.getElementById('scanProgressBar');
+    const labels = {{
+      de: {{connect:'Verbindung wird hergestellt …', discover:'Medienverzeichnisse werden durchsucht …',process:'Metadaten und Datenbank werden aktualisiert …',commit:'Änderungen werden gespeichert …'}},
+      en: {{connect:'Connecting …', discover:'Searching media directories …',process:'Updating metadata and database …',commit:'Saving changes …'}},
+      es: {{connect:'Conectando …', discover:'Buscando carpetas multimedia …',process:'Actualizando metadatos y base de datos …',commit:'Guardando cambios …'}}
+    }};
+    phase.textContent = (labels[activeLanguage] || labels.de)[state.stage] || labels.de.connect;
+    if (state.stage === 'process' || state.stage === 'commit') {{
+      const total = Math.max(0, Number(state.total) || 0);
+      const current = Math.max(0, Math.min(total, Number(state.current) || 0));
+      if (total > 0) {{
+        bar.value = Math.round(100 * current / total);
+        counter.textContent = `${{current}} / ${{total}} ` + (activeLanguage === 'en' ? 'titles' : activeLanguage === 'es' ? 'títulos' : 'Titel');
+      }} else {{ bar.removeAttribute('value'); counter.textContent = ''; }}
+      currentTitle.textContent = String(state.title || '');
+    }} else {{
+      bar.removeAttribute('value');
+      counter.textContent = '';
+      currentTitle.textContent = '';
+    }}
+  }} catch (error) {{ console.debug('Scan progress temporarily unavailable:', error); }}
+  finally {{ scanProgressBusy = false; }}
+}}
+async function runLibraryScan(form, credentials) {{
   saveViewState(null);
   const button = form.querySelector('button[type="submit"]');
   const originalText = button ? button.textContent : '';
-  if (button) {{
-    button.disabled = true;
-    button.textContent = t('scanning');
-  }}
-
+  if (button) {{button.disabled = true; button.textContent = t('scanning');}}
+  showScanProgress();
+  scanProgressTimer = setInterval(pollScanProgress, 350);
   try {{
     const response = await fetch('/scan', {{
       method: 'POST',
-      headers: {{ 'X-Requested-With': 'Mnemosyne' }},
-      cache: 'no-store'
+      headers: {{ 'X-Requested-With': 'Mnemosyne', 'Content-Type': 'application/json' }},
+      body: JSON.stringify(credentials || {{}}),
+      cache: 'no-store',
+      credentials: 'same-origin'
     }});
     const result = await response.json().catch(() => ({{}}));
-    if (!response.ok || result.ok === false) {{
-      throw new Error(result.error || t('scanFailed'));
-    }}
+    if (!response.ok || result.ok === false) throw new Error(result.error || t('scanFailed'));
+    document.getElementById('scanProgressPhase').textContent = activeLanguage === 'en' ? 'Complete!' : activeLanguage === 'es' ? '¡Completado!' : 'Aktualisierung abgeschlossen!';
+    document.getElementById('scanProgressBar').value = 100;
     window.location.reload();
   }} catch (error) {{
-    if (button) {{
-      button.disabled = false;
-      button.textContent = originalText;
-    }}
-    alert(error.message || String(error));
+    if (button) {{button.disabled = false; button.textContent = originalText;}}
+    document.getElementById('scanProgressPhase').textContent = activeLanguage === 'en' ? 'Update failed' : activeLanguage === 'es' ? 'Actualización fallida' : 'Aktualisierung fehlgeschlagen';
+    document.getElementById('scanProgressTitleName').textContent = error.message || String(error);
+    document.getElementById('scanProgressClose').hidden = false;
+    // A failed scan never discards the previously stored catalog.
+  }} finally {{
+    if (scanProgressTimer !== null) clearInterval(scanProgressTimer);
+    scanProgressTimer = null;
   }}
 }}
 
@@ -5826,8 +6527,9 @@ async function saveConfig(event) {{
   try {{ savedLanguage = sessionStorage.getItem(LANGUAGE_KEY) || CONFIG_STARTUP_LANGUAGE; }} catch (_) {{ savedLanguage = CONFIG_STARTUP_LANGUAGE; }}
   applyLanguage(savedLanguage);
   updateFavoriteButtons();
+  initializeVisibleCardMeasurements();
+  initializeMnemosyneIcon();
   // The startup overlay is already visible in HTML, before JS begins work.
-  // Schedule prewarming after the first paint, not in the page-load task.
   setTimeout(prepareLibraryOnStartup, 100);
   refreshServerStatus();
   window.setInterval(refreshServerStatus, 15000);
@@ -5838,7 +6540,7 @@ async function saveConfig(event) {{
 
 
 class CatalogWebHandler(BaseHTTPRequestHandler):
-    server_version = "Mnemosyne/4.15.29"
+    server_version = "Mnemosyne/4.15.44"
 
     def _send_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
@@ -5941,6 +6643,9 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                     "Linux-Series-Path": str(cfg.get("Linux-Series-Path") or DEFAULT_LINUX_SERIES_SOURCE),
                 },
             })
+            return
+        if path == "/scan-progress":
+            self._send_json({"ok": True, **self.app.get_scan_progress()})
             return
         if path == "/server-status":
             online, host = configured_server_status(self.app.args)
@@ -6045,13 +6750,28 @@ class CatalogWebHandler(BaseHTTPRequestHandler):
                     else:
                         self._send_html(render_web_catalog(self.app.args, error="Ein Scan läuft bereits."), 409)
                     return
+                self.app.set_scan_progress(running=True, stage="connect", current=0, total=0, title="")
                 try:
+                    scan_args = copy.copy(self.app.args)
+                    scan_password = self.app.password
+                    if ajax_scan:
+                        payload = self._json_body()
+                        if scan_needs_smb_auth(scan_args):
+                            username = payload.get("username")
+                            scan_password = payload.get("password")
+                            if not isinstance(username, str) or not username.strip() or len(username) > 256:
+                                raise CatalogError("Bitte einen gültigen SMB-Benutzernamen eingeben.")
+                            if not isinstance(scan_password, str) or not scan_password or len(scan_password) > 1024:
+                                raise CatalogError("Bitte das SMB-Passwort eingeben.")
+                            scan_args.benutzer = username.strip()
                     count, removed, api_requests, reused_metadata = scan_into_database(
-                        self.app.args,
-                        password=self.app.password,
+                        scan_args,
+                        password=scan_password,
                         omdb_key=self.app.omdb_key,
+                        progress=self.app.set_scan_progress,
                     )
                 finally:
+                    self.app.set_scan_progress(running=False, stage="done", title="")
                     self.app.scan_lock.release()
                 if ajax_scan:
                     self._send_json({
@@ -6153,6 +6873,19 @@ class WebAppContext:
     password: str | None
     omdb_key: str
     scan_lock: threading.Lock = field(default_factory=threading.Lock)
+    progress_lock: threading.Lock = field(default_factory=threading.Lock)
+    scan_progress: dict[str, Any] = field(default_factory=lambda: {
+        "running": False, "stage": "idle", "current": 0, "total": 0, "title": ""
+    })
+
+    def set_scan_progress(self, **changes: Any) -> None:
+        # No SMB credentials or passwords are ever saved in progress state.
+        with self.progress_lock:
+            self.scan_progress.update(changes)
+
+    def get_scan_progress(self) -> dict[str, Any]:
+        with self.progress_lock:
+            return dict(self.scan_progress)
 
     def apply_config(self, config: dict[str, Any]) -> None:
         global OMDB_DAILY_LIMIT
@@ -6380,7 +7113,7 @@ def _launch_isolated_browser(browser: tuple[str, str], url: str, port: int) -> s
         f"--app={url}",
     ]
     if sys.platform.startswith("linux"):
-        # Let KDE associate our Chromium app window with mnemosyne.desktop.
+        # X11 WM_CLASS hint; on Wayland KDE uses the Chromium app_id instead.
         command.insert(-1, "--class=Mnemosyne")
     log_path = _mnemosyne_browser_log()
     kwargs: dict[str, Any] = {}
@@ -6466,6 +7199,10 @@ def run_web_app(args: argparse.Namespace, *, password: str | None, omdb_key: str
             file=sys.stderr,
         )
     server.app = context  # type: ignore[attr-defined]
+
+    if not args.kein_startscan and scan_needs_smb_auth(args) and not (args.benutzer and password):
+        print("SMB-Startscan übersprungen: Bibliothek kann über die Oberfläche mit Anmeldung aktualisiert werden.", file=sys.stderr)
+        args.kein_startscan = True
 
     if not args.kein_startscan:
         try:
@@ -6694,7 +7431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.web = True
         args.kein_startscan = not bool(app_config.get("Scan-On-Startup", True))
     password = os.environ.get("SMB_PASSWORT")
-    if any(source.casefold().startswith("smb://") for source, _kind in configured_media_sources(args)) and args.benutzer and password is None:
+    if any(source.casefold().startswith("smb://") for source, _kind in configured_media_sources(args)) and args.benutzer and password is None and not args.web:
         if sys.stdin.isatty():
             password = getpass.getpass(f"SMB-Passwort für {args.benutzer}: ")
         else:
